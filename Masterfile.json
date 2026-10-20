@@ -1,0 +1,274 @@
+[
+  {
+    "Id": "explorer",
+    "Name": "File Explorer",
+    "Command": "explorer.exe",
+    "Arguments": "",
+    "Icon": "file-explorer.png",
+    "Description": "Open Windows File Explorer"
+  },
+  {
+    "Id": "notepad",
+    "Name": "Notepad",
+    "Command": "notepad.exe",
+    "Arguments": "",
+    "Icon": "notepad.png",
+    "Description": "Open Notepad"
+  },
+  {
+    "Id": "calculator",
+    "Name": "Calculator",
+    "Command": "calc.exe",
+    "Arguments": "",
+    "Icon": "Calculator.png",
+    "Description": "Open Calculator"
+  },
+  {
+    "Id": "powershell",
+    "Name": "Windows PowerShell",
+    "Command": "powershell.exe",
+    "Arguments": "",
+    "Icon": "Powershell.png",
+    "Description": "Open Windows PowerShell"
+  },
+  {
+    "Id": "edge",
+    "Name": "Microsoft Edge",
+    "Command": "msedge.exe",
+    "Arguments": "",
+    "Icon": "MSEdge.png",
+    "Description": "Open Microsoft Edge"
+  },
+  {
+    "Id": "cmd",
+    "Name": "Command Prompt",
+    "Command": "cmd.exe",
+    "Arguments": "",
+    "Icon": "cmd.png",
+    "Description": "Open Command Prompt"
+  },
+  {
+    "Id": "control",
+    "Name": "Control Panel",
+    "Command": "control.exe",
+    "Arguments": "",
+    "Icon": "ControlPanel.png",
+    "Description": "Open Control Panel"
+  },
+  {
+    "Id": "taskmgr",
+    "Name": "Task Manager",
+    "Command": "taskmgr.exe",
+    "Arguments": "",
+    "Icon": "TASKMGR.png",
+    "Description": "Open Task Manager"
+  },
+  {
+    "Id": "services",
+    "Name": "Services",
+    "Command": "services.msc",
+    "Arguments": "",
+    "Icon": "Services.png",
+    "Description": "Open Windows Services"
+  },
+  {
+    "Id": "eventviewer",
+    "Name": "Event Viewer",
+    "Command": "eventvwr.msc",
+    "Arguments": "",
+    "Icon": "EventViewer.png",
+    "Description": "Open Event Viewer"
+  },
+  {
+    "Id": "AccessCentral",
+    "Name": "Access Central",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://itg.identityaccess.hcahealthcare.cloud/LandingPage/AccessCentralIndex#/\"",
+    "Icon": "AccessCentral.png",
+    "Description": "Open Access Central"
+  },
+  {
+    "Id": "Heartflow",
+    "Name": "Heartflow",
+    "Command": "msedge.exe",
+    "Arguments": "https://app.heartflow.net/",
+    "Icon": "Heartflow.png",
+    "Description": "Heart Flow"
+  },
+  {
+    "Id": "Meditech3-5",
+    "Name": "Meditech 3-5",
+    "Command": "C:\\ProgramData\\Launchpad\\Expanse.bat",
+    "Arguments": "",
+    "Icon": "Meditech.png",
+    "Description": "Expanse 3-5"
+  },
+  {
+    "Id": "Expanse-NHA",
+    "Name": "Expanse - LIVE",
+    "Command": "C:\\ProgramData\\Launchpad\\Expanse1.bat",
+    "Arguments": "",
+    "Icon": "Meditech1.png",
+    "Description": "Expanse - NHA  (no sso, credapp, vbs)"
+  },
+  {
+    "Id": "Expanse-Mobile-VAA",
+    "Name": "Expanse Mobile VAA",
+    "Command": "msedge.exe",
+    "Arguments": "https://mobilecap.exp.hca.cloud/live/va/?data=LABL",
+    "Icon": "Meditech.png",
+    "Description": "Expanse Mobile VAA"
+  },
+  {
+    "Id": "Expanse-Mobile-NHA",
+    "Name": "Expanse Mobile NHA",
+    "Command": "msedge.exe",
+    "Arguments": "https://mobilecap.exp.hca.cloud/live/va/?data=LABL",
+    "Icon": "Meditech.png",
+    "Description": "Expanse Mobile NHA"
+  },
+  {
+    "Id": "Expanse Test",
+    "Name": "Expanse Test",
+    "Command": "msedge.exe",
+    "Arguments": "https://ehrcap.exp.hca.cloud/test/",
+    "Icon": "Meditech.png",
+    "Description": "Expanse - Test"
+  },
+  {
+    "Id": "Expanse-HIE-NHA",
+    "Name": "Expanse HIE",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "C:\\Program Files (x86)\\Interface People\\IPeople_with_dbMotion\\IPeople_Web\\Script\\IPScriptAssist.exe",
+    "Icon": "Meditech.png",
+    "Description": "Expanse - Test"
+  },
+  {
+    "Id": "PK-Edge",
+    "Name": "Patient Keeper - Edge",
+    "Command": "msedge.exe",
+    "Arguments": "https://crdv.portal.medcity.net/",
+    "Icon": "MSEdge.png",
+    "Description": "PK Edge Portal"
+  },
+  {
+    "Id": "Service-Central",
+    "Name": "Service Central",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://hcaservicecentral.service-now.com/\"",
+    "Icon": "ServCentral.ico",
+    "Description": "Service Cerntral"
+  },
+  {
+    "Id": "Clarity",
+    "Name": "Clarity",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://clarity.hca.moventus.com/\"",
+    "Icon": "Clarity.ico",
+    "Description": "Clarity"
+  },
+  {
+    "Id": "HeartSuite",
+    "Name": "HeartSuite",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://cwdvekgmgt.hca.corpad.net/\"",
+    "Icon": "MSEdge.png",
+    "Description": "HeartSuite"
+  },
+  {
+    "Id": "JIRA",
+    "Name": "Jira",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://jira.app.medcity.net/j/\"",
+    "Icon": "MSEdge.png",
+    "Description": "Jira"
+  },
+  {
+    "Id": "Yourcause",
+    "Name": "Yourcause",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://hca.yourcause.com/\"",
+    "Icon": "MSEdge.png",
+    "Description": "Your cause"
+  },
+  {
+    "Id": "Concur",
+    "Name": "Concur",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://us2.concursolutions.com/home/\"",
+    "Icon": "Concur.png",
+    "Description": "Concur"
+  },
+  {
+    "Id": "HCAHRAnswers",
+    "Name": "HCAHRAnswers",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"http://www.hcahranswers.com/\"",
+    "Icon": "MSEdge.png",
+    "Description": "HCAHRAnswers"
+  },
+  {
+    "Id": "eSAF",
+    "Name": "eSAF",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://esaf.hca.corpad.net/\"",
+    "Icon": "MSEdge.png",
+    "Description": "eSAF"
+  },
+  {
+    "Id": "Sharepoint",
+    "Name": "Sharepoint",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://hcahealthcare.sharepoint.com/\"",
+    "Icon": "MSEdge.png",
+    "Description": "Sharepoint"
+  },
+  {
+    "Id": "HealthStream",
+    "Name": "HealthStream",
+    "Command": "C:\\Program Files (x86)\\Imprivata\\OneSign Agent\\x64\\ISXRunAs.exe",
+    "Arguments": "/netOnly \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" \"https://app.hstream.com/home/\"",
+    "Icon": "MSEdge.png",
+    "Description": "HealthStream"
+  },
+  {
+    "Id": "FTWKronosEte",
+    "Name": "FTWKronosEte",
+    "Command": "msedge.exe",
+    "Arguments": "http://ftwprod.kronos.medcity.net:81/Employee_Time_Entry",
+    "Icon": "MSEdge.png",
+    "Description": "FTWKronosEte"
+  },
+  {
+    "Id": "KronosManager",
+    "Name": "KronosManager",
+    "Command": "msedge.exe",
+    "Arguments": "http://nasprod.kronos.medcity.net:82/kronos61",
+    "Icon": "MSEdge.png",
+    "Description": "KronosManager"
+  },
+  {
+    "Id": "KronosEmployee",
+    "Name": "KronosEmployee",
+    "Command": "msedge.exe",
+    "Arguments": "http://nasprod.kronos.medcity.net:82/emp",
+    "Icon": "",
+    "Description": "KronosEmployee"
+  },
+  {
+    "Id": "KronosFManager",
+    "Name": "KronosFManager",
+    "Command": "msedge.exe",
+    "Arguments": "http://ftwprod.kronos.medcity.net:82/kronos61",
+    "Icon": "MSEdge.png",
+    "Description": "KronosFManager"
+  },
+  {
+    "Id": "KronosFEmployee",
+    "Name": "KronosFEmployee",
+    "Command": "msedge.exe",
+    "Arguments": "http://ftwprod.kronos.medcity.net:82/emp",
+    "Icon": "",
+    "Description": "KronosFEmployee"
+  }
+]

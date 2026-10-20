@@ -1,0 +1,32 @@
+{
+  "Config": [
+    {
+      "Name": "User Button File",
+      "Value": "FMBM.json"
+    },
+    {
+      "Name": "Master Button File",
+      "Value": "Masterfile.json"
+    },
+    {
+      "Name": "Button Limit",
+      "Value": "30"
+    },
+    {
+      "Name": "Top Space for Toolbar",
+      "Value": "45"
+    },
+    {
+      "Name": "Logged In User",
+      "Value": "C:\\ProgramData\\Launchpad\\INIToolBackup\\FMBM\\loggedinUser.txt"
+    },
+	{
+      "Name": "App Exclusion",
+      "Value": "notepad.exe, calculator.exe"
+    },
+    {
+      "Name": "RoleShare",
+      "Value": "\\\\xrdcnpsvmcfs01_cfs_ag1.hca.corpad.net\\onesign_files01\\CORP_RoleShare\\"
+    }
+  ]
+}
