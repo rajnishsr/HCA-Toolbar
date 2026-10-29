@@ -1,33 +1,10 @@
 ﻿{
     "SelectedButtonIds":  [
                               "notepad",
-                              "explorer",
-                              "calculator",
-                              "AccessCentral",
                               "powershell",
-                              "cmd",
-                              "Heartflow",
-                              "eSAF",
-                              "HealthStream",
-                              "Sharepoint",
-                              "FTWKronosEte",
                               "edge",
+                              "cmd",
                               "control",
-                              "taskmgr",
-                              "services",
-                              "eventviewer",
-                              "Meditech3-5",
-                              "Expanse-NHA",
-                              "Expanse-Mobile-VAA",
-                              "Expanse-Mobile-NHA",
-                              "Expanse Test",
-                              "Expanse-HIE-NHA",
-                              "PK-Edge",
-                              "Service-Central",
-                              "Clarity",
-                              "HeartSuite",
-                              "JIRA",
-                              "Yourcause",
-                              "Concur"
+                              "taskmgr"
                           ]
 }

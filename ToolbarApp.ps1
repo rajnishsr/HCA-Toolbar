@@ -2,9 +2,76 @@
 # Windows PowerShell 5.1+ / PowerShell 7+ on Windows
 # Reads Buttons.json as the master catalog and ToolbarConfig.json as the user's selection.
 
+# Configure DPI awareness before Windows Forms creates any window handles.
+# PS2EXE may set process DPI awareness through its embedded manifest already.
+# In that case ERROR_ACCESS_DENIED means the existing process setting is locked.
+$script:DpiAwarenessResult = 'Not attempted'
+if (-not ('HcaEarlyDpiAwareness' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class HcaEarlyDpiAwareness {
+    [DllImport("user32.dll", EntryPoint="SetProcessDpiAwarenessContext", SetLastError=true)]
+    private static extern bool SetContext(IntPtr value);
+    [DllImport("shcore.dll", EntryPoint="SetProcessDpiAwareness", PreserveSig=true)]
+    private static extern int SetAwareness(int awareness);
+    [DllImport("user32.dll", EntryPoint="SetProcessDPIAware", SetLastError=true)]
+    private static extern bool SetLegacy();
+    public static string Initialize() {
+        try {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            if (SetContext(new IntPtr(-4))) return "PerMonitorV2";
+            int error = Marshal.GetLastWin32Error();
+            if (error == 5) return "Already configured by host or manifest (error 5)";
+        } catch (EntryPointNotFoundException) {}
+          catch (DllNotFoundException) {}
+        try {
+            // PROCESS_PER_MONITOR_DPI_AWARE = 2
+            int hr = SetAwareness(2);
+            if (hr == 0) return "PerMonitorV1";
+            if ((uint)hr == 0x80070005) return "Already configured by host or manifest (E_ACCESSDENIED)";
+        } catch (EntryPointNotFoundException) {}
+          catch (DllNotFoundException) {}
+        try {
+            if (SetLegacy()) return "SystemDpiAware";
+        } catch (EntryPointNotFoundException) {}
+          catch (DllNotFoundException) {}
+        return "Could not change process DPI awareness";
+    }
+}
+'@
+}
+$script:DpiAwarenessResult = [HcaEarlyDpiAwareness]::Initialize()
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Single-instance guard: shared by .ps1 and compiled .exe instances in the
+# same interactive Windows session. The first process owns the mutex until exit.
+$script:ToolbarInstanceMutex = $null
+$script:ToolbarOwnsMutex = $false
+try {
+    $script:ToolbarInstanceMutex = New-Object System.Threading.Mutex(
+        $false, 'Local\HCA_ToolbarApp_SingleInstance'
+    )
+    try {
+        $script:ToolbarOwnsMutex = $script:ToolbarInstanceMutex.WaitOne(0, $false)
+    } catch [System.Threading.AbandonedMutexException] {
+        # The prior owner terminated unexpectedly; we now own the mutex.
+        $script:ToolbarOwnsMutex = $true
+    }
+    if (-not $script:ToolbarOwnsMutex) {
+        # A toolbar is already running. Do not start another copy.
+        $script:ToolbarInstanceMutex.Dispose()
+        return
+    }
+} catch {
+    if ($script:ToolbarInstanceMutex) {
+        $script:ToolbarInstanceMutex.Dispose()
+    }
+    throw "Unable to establish toolbar single-instance protection: $($_.Exception.Message)"
+}
 
 #$AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Get the folder where the script or compiled EXE is located.
@@ -18,6 +85,60 @@ else {
 }
 
 # Config.json is the single source for deployment settings.
+
+# Shared visibility signal read by Reserve-Top.exe. The PID prevents stale
+# state left by an earlier run from hiding a different toolbar instance.
+$script:VisibilityDirectory = Join-Path $AppDir 'logs'
+$script:VisibilityStateFile = Join-Path $script:VisibilityDirectory 'ToolbarVisibility.json'
+function Publish-ToolbarVisibility {
+    param([bool]$Visible)
+    try {
+        if (-not (Test-Path -LiteralPath $script:VisibilityDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $script:VisibilityDirectory -Force -ErrorAction Stop | Out-Null
+        }
+        $currentScreen = [System.Windows.Forms.Screen]::FromControl($form)
+        $monitorBounds = $currentScreen.Bounds
+        $payload = @{
+            ProcessId = $PID
+            ReserveSpace = $Visible
+            Monitor = $currentScreen.DeviceName
+            MonitorBounds = @{
+                X = $monitorBounds.X
+                Y = $monitorBounds.Y
+                Width = $monitorBounds.Width
+                Height = $monitorBounds.Height
+            }
+        } | ConvertTo-Json -Compress
+        $tempFile = "$($script:VisibilityStateFile).$PID.tmp"
+        [System.IO.File]::WriteAllText($tempFile, $payload)
+        Move-Item -LiteralPath $tempFile -Destination $script:VisibilityStateFile -Force
+    } catch {
+        Write-ToolbarLog -Level WARNING -Message ("Could not publish toolbar visibility: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Remove-ToolbarVisibilityState {
+    try {
+        if (-not (Test-Path -LiteralPath $script:VisibilityStateFile -PathType Leaf)) { return }
+        $state = Get-Content -LiteralPath $script:VisibilityStateFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ([int]$state.ProcessId -eq $PID) {
+            Remove-Item -LiteralPath $script:VisibilityStateFile -Force -ErrorAction Stop
+        }
+    } catch {
+        Write-ToolbarLog -Level WARNING -Message ("Visibility-state cleanup failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+# Reserve desktop space only when the toolbar is visible AND docked.
+# Reserve-Top reads the same state file used by Hide / Unhide.
+function Publish-ToolbarReservationState {
+    $isDocked = -not $script:ToolbarHasBeenParked
+    $isVisible = $form.Visible -and -not $script:ToolbarAutoHidden
+    $reserve = $isDocked -and $isVisible
+    Publish-ToolbarVisibility -Visible $reserve
+    Write-ToolbarLog -Message ("RESERVATION_STATE Docked={0} Visible={1} ReserveSpace={2}" -f $isDocked, $isVisible, $reserve)
+}
+
 $SettingsFile = Join-Path $AppDir 'Config.json'
 if (-not (Test-Path -LiteralPath $SettingsFile -PathType Leaf)) {
     throw "Toolbar settings file not found: $SettingsFile"
@@ -50,25 +171,151 @@ function Resolve-ToolbarSettingPath {
     return $path
 }
 $ConfigFile = Resolve-ToolbarSettingPath (Get-RequiredToolbarSetting 'User Button File')
-$MasterFile = Resolve-ToolbarSettingPath (Get-RequiredToolbarSetting 'Master Button File')
+# Read the registry location from Config.json ("Genshare Registry").
+# Expected: HKLM\SOFTWARE\SSOProvider\ISXAgent:Type
+# For compatibility, also accept the older log-format string in Config.json.
+$genshareRegistrySetting = (Get-RequiredToolbarSetting 'Genshare Registry').Trim()
+$registrySpecification = $genshareRegistrySetting
+if ($registrySpecification -match "['""]((?:HKLM|HKEY_LOCAL_MACHINE|Registry::HKEY_LOCAL_MACHINE)\\[^'""]+:[^'""]+)['""]") {
+    $registrySpecification = $Matches[1]
+}
+$separator = $registrySpecification.LastIndexOf(':')
+if ($separator -le 0 -or $separator -eq $registrySpecification.Length - 1) {
+    throw "Invalid 'Genshare Registry' setting. Expected HKLM\SOFTWARE\SSOProvider\ISXAgent:Type."
+}
+$registryKey = $registrySpecification.Substring(0, $separator)
+$registryValueName = $registrySpecification.Substring($separator + 1)
+if ($registryKey -match '^HKLM\\') {
+    $registryKey = 'Registry::HKEY_LOCAL_MACHINE\' + $registryKey.Substring(5)
+} elseif ($registryKey -match '^HKEY_LOCAL_MACHINE\\') {
+    $registryKey = 'Registry::' + $registryKey
+} elseif ($registryKey -notmatch '^Registry::HKEY_LOCAL_MACHINE\\') {
+    throw "Genshare Registry must specify an HKLM registry key."
+}
+$script:MasterSelectionReason = 'Registry value not found'
+$script:SSOProviderType = $null
+$masterSettingName = 'Master Button File'
+try {
+    $registryValue = Get-ItemPropertyValue -LiteralPath $registryKey -Name $registryValueName -ErrorAction Stop
+    $script:SSOProviderType = [string]$registryValue
+    if ([string]$registryValue -eq '2') {
+        $masterSettingName = 'Master Button Genshare File'
+        $script:MasterSelectionReason = 'Registry Type=2'
+    } else {
+        $script:MasterSelectionReason = "Registry Type=$registryValue (not 2)"
+    }
+} catch {
+    $script:MasterSelectionReason = "Registry unavailable: $($_.Exception.Message)"
+}
+$script:GenshareRegistryLocation = "$($registryKey):$registryValueName"
+$MasterFile = Resolve-ToolbarSettingPath (Get-RequiredToolbarSetting $masterSettingName)
 $IconFolder = Join-Path $AppDir 'icon'
 [int]$buttonLimit = 0
 if (-not [int]::TryParse((Get-RequiredToolbarSetting 'Button Limit'), [ref]$buttonLimit) -or $buttonLimit -lt 1) {
     throw "Config.json 'Button Limit' must be a positive integer."
 }
 $MaxSelectedButtons = $buttonLimit
-[int]$topSpace = 0
-if (-not [int]::TryParse((Get-RequiredToolbarSetting 'Top Space for Toolbar'), [ref]$topSpace) -or $topSpace -lt 2) {
-    throw "Config.json 'Top Space for Toolbar' must be an integer of at least 2."
+# Rows defaults to 1. Only an explicit value of 2 enables two-row mode.
+$rowsValue = if ($settings.ContainsKey('Rows')) { ([string]$settings['Rows']).Trim() } else { '' }
+[int]$toolbarRows = if ($rowsValue -eq '2') { 2 } else { 1 }
+$script:RowsSettingSource = if (-not $settings.ContainsKey('Rows')) {
+    'Missing; defaulted to 1'
+} elseif ($rowsValue -eq '2') {
+    'Configured as 2'
+} elseif ($rowsValue -eq '1') {
+    'Configured as 1'
+} else {
+    "Unsupported value '$rowsValue'; defaulted to 1"
 }
-$ToolbarHeight = $topSpace - 1
+$topSpace = if ($toolbarRows -eq 2) { 66 } else { 45 }
+$ToolbarHeight = $topSpace
+$script:TwoRowMode = ($toolbarRows -eq 2)
 $FileValuePath = Resolve-ToolbarSettingPath (Get-RequiredToolbarSetting 'Logged In User')
+# Section 4 third control: Kill, LogOff, or None (case-insensitive).
+$ThirdButtonMode = (Get-RequiredToolbarSetting 'Third Button').Trim()
+if ($ThirdButtonMode -notin @('Kill', 'LogOff', 'None')) {
+    $message = "Invalid 'Third Button' in Config.json: '$ThirdButtonMode'. Only Kill, LogOff, or None are allowed."
+    [System.Windows.Forms.MessageBox]::Show(
+        $message, 'HCA Toolbar Configuration Error',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+    throw $message
+}
+$ThirdButtonMode = switch ($ThirdButtonMode.ToLowerInvariant()) {
+    'kill' { 'Kill' }
+    'logoff' { 'LogOff' }
+    'none' { 'None' }
+}
+# Require a clear Yes/No setting for Windows logoff confirmation.
+$LogOffConfirmation = (Get-RequiredToolbarSetting 'LogOff Confirmation').Trim()
+if ($LogOffConfirmation -notin @('Yes', 'No')) {
+    $message = "Invalid 'LogOff Confirmation' in Config.json: '$LogOffConfirmation'. Only Yes or No are allowed."
+    [System.Windows.Forms.MessageBox]::Show(
+        $message, 'HCA Toolbar Configuration Error',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+    throw $message
+}
+$LogOffConfirmation = if ($LogOffConfirmation -ieq 'Yes') { 'Yes' } else { 'No' }
+$PasswordResetUrl = (Get-RequiredToolbarSetting 'PRT URL').Trim()
+if (-not [Uri]::IsWellFormedUriString($PasswordResetUrl, [UriKind]::Absolute) -or
+    -not ($PasswordResetUrl -match '^https?://')) {
+    throw "Config.json 'PRT URL' must be a valid HTTP or HTTPS URL."
+}
+
+# Optional startup visibility setting (defaults to visible for older configs).
+$startHiddenSetting = 'No'
+if ($settings.ContainsKey('Start Hidden')) {
+    $startHiddenSetting = ([string]$settings['Start Hidden']).Trim()
+}
+if ($startHiddenSetting -notin @('Yes', 'No')) {
+    throw "Config.json 'Start Hidden' must be 'Yes' or 'No'."
+}
+$script:StartToolbarHidden = ($startHiddenSetting -ieq 'Yes')
 
 $ToolbarTitle = 'Top Toolbar'
-$BackColor = [System.Drawing.Color]::FromArgb(245,245,245)
-$ButtonColor = [System.Drawing.Color]::White
-$TextColor = [System.Drawing.Color]::FromArgb(35,35,35)
-$HoverColor = [System.Drawing.Color]::FromArgb(232,232,232)
+# Select the toolbar theme from Config.json. Default to Light Mode if omitted.
+$darkModeSetting = 'No'
+if ($settings.ContainsKey('Dark Mode')) {
+    $darkModeSetting = ([string]$settings['Dark Mode']).Trim()
+}
+if ($darkModeSetting -notin @('Yes', 'No', 'Windows')) {
+    throw "Config.json 'Dark Mode' must be 'Yes', 'No', or 'Windows'."
+}
+$IsDarkMode = $darkModeSetting -ieq 'Yes'
+if ($darkModeSetting -ieq 'Windows') {
+    try {
+        $windowsLightTheme = Get-ItemPropertyValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'SystemUsesLightTheme' -ErrorAction Stop
+        if ($windowsLightTheme -notin @(0, 1)) {
+            throw "Unexpected SystemUsesLightTheme value: $windowsLightTheme"
+        }
+        $IsDarkMode = [int]$windowsLightTheme -eq 0
+    } catch {
+        # If the Windows setting is unavailable, use Light Mode.
+        Write-Warning "Unable to read Windows theme; using Light Mode. $($_.Exception.Message)"
+        $IsDarkMode = $false
+    }
+}
+if ($IsDarkMode) {
+    $BackColor = [System.Drawing.Color]::FromArgb(32, 34, 39)
+    $ButtonColor = [System.Drawing.Color]::FromArgb(53, 57, 64)
+    $TextColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    $HoverColor = [System.Drawing.Color]::FromArgb(75, 81, 91)
+    # High-contrast border so rounded buttons remain visible on dark surfaces.
+    $ButtonBorderColor = [System.Drawing.Color]::FromArgb(190, 202, 219)
+    $WatermarkThemeColor = [System.Drawing.Color]::FromArgb(188, 207, 235)
+    $ToolbarThemeBorderColor = [System.Drawing.Color]::FromArgb(91, 136, 190)
+} else {
+    $BackColor = [System.Drawing.Color]::FromArgb(245,245,245)
+    $ButtonColor = [System.Drawing.Color]::White
+    $TextColor = [System.Drawing.Color]::FromArgb(35,35,35)
+    $HoverColor = [System.Drawing.Color]::FromArgb(232,232,232)
+    $ButtonBorderColor = [System.Drawing.Color]::Black
+    $WatermarkThemeColor = [System.Drawing.Color]::FromArgb(9,34,64)
+    $ToolbarThemeBorderColor = [System.Drawing.Color]::FromArgb(3,45,108)
+}
 
 # ToolbarConfig logging. The active log is appended to until it reaches 5 MB.
 # Up to five files are retained: ToolbarAppLog.log through ToolbarAppLog.4.log.
@@ -133,15 +380,53 @@ function Write-ToolbarLog {
 }
 
 Initialize-ToolbarLog
+Write-ToolbarLog -Message ("DPI_AWARENESS Startup={0}" -f $script:DpiAwarenessResult)
 Write-ToolbarLog -Message ("Starting toolbar. AppDir='{0}'" -f $AppDir)
 
 # Audit the effective settings after Config.json has been parsed and validated.
 # Logging is initialized here, so all values are written to the configured logs folder.
 Write-ToolbarLog -Message ("CONFIG Name='User Button File' Value='{0}' ResolvedPath='{1}'" -f $settings['User Button File'], $ConfigFile)
-Write-ToolbarLog -Message ("CONFIG Name='Master Button File' Value='{0}' ResolvedPath='{1}'" -f $settings['Master Button File'], $MasterFile)
+Write-ToolbarLog -Message ("MASTER_SELECTION Registry='{3}' RegistryValue='{0}' Reason='{1}' SelectedSetting='{2}'" -f $script:SSOProviderType, $script:MasterSelectionReason, $masterSettingName, $script:GenshareRegistryLocation)
+Write-ToolbarLog -Message ("CONFIG Name='{0}' Value='{1}' ResolvedPath='{2}'" -f $masterSettingName, $settings[$masterSettingName], $MasterFile)
+Write-ToolbarLog -Message ("CONFIG Name='Genshare Registry' Value='{0}' Resolved='{1}'" -f $genshareRegistrySetting, $script:GenshareRegistryLocation)
+Write-ToolbarLog -Message ("CONFIG Name='PRT URL' Value='{0}'" -f $PasswordResetUrl)
+Write-ToolbarLog -Message ("CONFIG Name='Third Button' Value='{0}'" -f $ThirdButtonMode)
+Write-ToolbarLog -Message ("CONFIG Name='LogOff Confirmation' Value='{0}'" -f $LogOffConfirmation)
 Write-ToolbarLog -Message ("CONFIG Name='Button Limit' Value='{0}' MaxSelectedButtons={1}" -f $settings['Button Limit'], $MaxSelectedButtons)
-Write-ToolbarLog -Message ("CONFIG Name='Top Space for Toolbar' Value='{0}' ToolbarHeight={1}" -f $settings['Top Space for Toolbar'], $ToolbarHeight)
+Write-ToolbarLog -Message ("CONFIG Name='Rows' EffectiveValue='{0}' Source='{1}' TopSpace={2} ToolbarHeight={3}" -f $toolbarRows, $script:RowsSettingSource, $topSpace, $ToolbarHeight)
+Write-ToolbarLog -Message ("CONFIG Name='Dark Mode' Value='{0}' Theme='{1}'" -f $darkModeSetting, $(if ($IsDarkMode) { 'Dark' } else { 'Light' }))
 Write-ToolbarLog -Message ("CONFIG Name='Logged In User' Value='{0}' ResolvedPath='{1}'" -f $settings['Logged In User'], $FileValuePath)
+
+# Validate the selected master catalog before constructing the toolbar UI.
+# Do not silently fall back to the standard master when registry Type=2:
+# that could show applications from the wrong catalog.
+if (-not (Test-Path -LiteralPath $MasterFile -PathType Leaf)) {
+    $message = "The selected master button file was not found.`n`n" +
+               "Configuration: $masterSettingName`n" +
+               "Expected file: $MasterFile`n`n" +
+               "The HCA Toolbar will now exit."
+    Write-ToolbarLog -Level ERROR -Message (
+        "STARTUP_ABORT Master button file missing. Setting='{0}' Path='{1}' RegistryType='{2}'" -f
+        $masterSettingName, $MasterFile, $script:SSOProviderType
+    )
+    [System.Windows.Forms.MessageBox]::Show(
+        $message,
+        'HCA Toolbar - Missing Master File',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+
+    # Startup exits before Application.Run(), so release the mutex here.
+    if ($script:ToolbarOwnsMutex -and $script:ToolbarInstanceMutex) {
+        try { $script:ToolbarInstanceMutex.ReleaseMutex() } catch {}
+        $script:ToolbarOwnsMutex = $false
+    }
+    if ($script:ToolbarInstanceMutex) {
+        $script:ToolbarInstanceMutex.Dispose()
+        $script:ToolbarInstanceMutex = $null
+    }
+    return
+}
 
 
 # When the number of selected application buttons is greater than this value,
@@ -150,10 +435,92 @@ $EqualWidthThreshold = 19
 $WatermarkText = 'HCA Toolbar'
 # HCA Healthcare brand-inspired watermark: navy HCA sans-serif,
 # followed by navy Toolbar in a bold serif similar to Healthcare.
-$WatermarkColor = [System.Drawing.Color]::FromArgb(9,34,64)
+$WatermarkColor = $WatermarkThemeColor
 $WatermarkMarkPath = Join-Path $IconFolder 'HCA_OrangeMark.png'
 $WatermarkHCAFont = New-Object System.Drawing.Font('Arial', 17, [System.Drawing.FontStyle]::Bold)
 $WatermarkToolbarFont = New-Object System.Drawing.Font('Georgia', 16, [System.Drawing.FontStyle]::Bold)
+
+# Hoverable information icon displayed immediately after the Toolbar word.
+$ToolbarInfoMarkdown = if ($settings.ContainsKey('Toolbar Info')) { [string]$settings['Toolbar Info'] } else { '' }
+$script:ToolbarInfoBounds = [System.Drawing.RectangleF]::Empty
+# Use a native WinForms ToolTip instead of a ToolStripDropDown.
+# Native ToolTips dismiss themselves; dropdown windows can remain open.
+$script:ToolbarInfoVisible = $false
+$script:ToolbarInfoToolTip = New-Object System.Windows.Forms.ToolTip
+$script:ToolbarInfoToolTip.IsBalloon = $false
+$script:ToolbarInfoToolTip.ShowAlways = $true
+$script:ToolbarInfoToolTip.InitialDelay = 0
+$script:ToolbarInfoToolTip.ReshowDelay = 100
+$script:ToolbarInfoToolTip.AutoPopDelay = 5000
+$script:ToolbarInfoToolTip.UseAnimation = $true
+$script:ToolbarInfoToolTip.UseFading = $true
+# Standard ToolTip supports plain text, so remove Markdown bold markers.
+$script:ToolbarInfoPlainText = ($ToolbarInfoMarkdown -replace '\*\*', '' -replace "`r`n", "`n")
+$ToolbarInfoFont = New-Object System.Drawing.Font('Georgia', 8, [System.Drawing.FontStyle]::Bold)
+
+# Wrap tooltip text to no more than half the width of the monitor
+# containing the information icon. Recalculate on each hover so it also
+# works when the toolbar is moved to a different display.
+function Format-ToolbarInfoForScreen {
+    param([string]$Text, [System.Windows.Forms.Control]$Anchor)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $screen = [System.Windows.Forms.Screen]::FromControl($Anchor)
+    $maxWidth = [Math]::Max(120, [int][Math]::Floor($screen.WorkingArea.Width / 2) - 36)
+    $font = [System.Drawing.SystemFonts]::DefaultFont
+    $flags = [System.Windows.Forms.TextFormatFlags]::NoPadding -bor [System.Windows.Forms.TextFormatFlags]::SingleLine
+    $result = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($paragraph in ($Text -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($paragraph)) {
+            [void]$result.Add('')
+            continue
+        }
+        $line = ''
+        foreach ($word in ($paragraph.Trim() -split '\s+')) {
+            $candidate = if ($line.Length -eq 0) { $word } else { "$line $word" }
+            $size = [System.Windows.Forms.TextRenderer]::MeasureText($candidate, $font, [System.Drawing.Size]::Empty, $flags)
+            if ($line.Length -gt 0 -and $size.Width -gt $maxWidth) {
+                [void]$result.Add($line)
+                $line = $word
+            } else {
+                $line = $candidate
+            }
+        }
+        if ($line.Length -gt 0) { [void]$result.Add($line) }
+    }
+    return ($result -join "`n")
+}
+
+function Show-ToolbarInfoPopup {
+    if ($script:ToolbarInfoVisible -or [string]::IsNullOrWhiteSpace($script:ToolbarInfoPlainText)) { return }
+    if (-not $flow -or -not $flow.IsHandleCreated) { return }
+    $script:ToolbarInfoVisible = $true
+    # Explicit 5-second lifetime guarantees the tip cannot remain indefinitely.
+    $wrappedInfo = Format-ToolbarInfoForScreen -Text $script:ToolbarInfoPlainText -Anchor $flow
+
+    # Estimate the rendered width of the wrapped tooltip and center it beneath
+    # the mouse pointer. ToolTip.Show expects coordinates relative to $flow.
+    $font = [System.Drawing.SystemFonts]::DefaultFont
+    $flags = [System.Windows.Forms.TextFormatFlags]::NoPadding -bor [System.Windows.Forms.TextFormatFlags]::SingleLine
+    $textWidth = 0
+    foreach ($line in ($wrappedInfo -split "`n")) {
+        $lineWidth = [System.Windows.Forms.TextRenderer]::MeasureText($line, $font, [System.Drawing.Size]::Empty, $flags).Width
+        $textWidth = [Math]::Max($textWidth, $lineWidth)
+    }
+    $tipWidth = $textWidth + 24 # Allow for the native tooltip border and padding.
+    $mouseScreen = [System.Windows.Forms.Cursor]::Position
+    $screen = [System.Windows.Forms.Screen]::FromPoint($mouseScreen)
+    $workArea = $screen.WorkingArea
+    $tipLeft = [int]($mouseScreen.X - [Math]::Floor($tipWidth / 2))
+    $tipLeft = [Math]::Max($workArea.Left + 4, [Math]::Min($tipLeft, $workArea.Right - $tipWidth - 4))
+    $tipTop = [int]($mouseScreen.Y + 20)
+    $anchorPoint = $flow.PointToClient((New-Object System.Drawing.Point($tipLeft, $tipTop)))
+    $script:ToolbarInfoToolTip.Show($wrappedInfo, $flow, $anchorPoint.X, $anchorPoint.Y, 5000)
+}
+
+function Hide-ToolbarInfoPopup {
+    $script:ToolbarInfoVisible = $false
+    if ($script:ToolbarInfoToolTip -and $flow) { $script:ToolbarInfoToolTip.Hide($flow) }
+}
 
 function Draw-HCABrandWatermark {
     param([System.Drawing.Graphics]$Graphics, [System.Drawing.RectangleF]$Area)
@@ -168,7 +535,9 @@ function Draw-HCABrandWatermark {
         $toolbarSize = $Graphics.MeasureString($toolbar, $WatermarkToolbarFont, 1000, $format)
         $markWidth = 19.0
         $markGap = 2.0
-        $totalWidth = $hcaSize.Width + $markWidth + $markGap + $toolbarSize.Width
+        $infoGap = 3.0
+        $infoWidth = 14.0
+        $totalWidth = $hcaSize.Width + $markWidth + $markGap + $toolbarSize.Width + $infoGap + $infoWidth
         $x = $Area.Left + ($Area.Width - $totalWidth) / 2
         $hcaY = $Area.Top + ($Area.Height - $hcaSize.Height) / 2
         $toolbarY = $Area.Top + ($Area.Height - $toolbarSize.Height) / 2
@@ -188,6 +557,26 @@ function Draw-HCABrandWatermark {
         }
         $Graphics.DrawString($toolbar, $WatermarkToolbarFont, $brush,
             ([System.Drawing.PointF]::new([float]($x + $hcaSize.Width + $markWidth + $markGap), [float]$toolbarY)), $format)
+        $infoX = [float]($x + $hcaSize.Width + $markWidth + $markGap + $toolbarSize.Width + $infoGap)
+        # Superscript-style info symbol: 50% of the original 18px circle,
+        # raised to the top-right of "Toolbar" (similar to x-squared).
+        $infoY = [float]($toolbarY + 1)
+        $infoDiameter = 9.0
+        # Keep a larger hover target so the tiny symbol remains usable.
+        $script:ToolbarInfoBounds = [System.Drawing.RectangleF]::new($infoX - 2, $infoY - 2, 18.0, 18.0)
+        if (-not [string]::IsNullOrWhiteSpace($ToolbarInfoMarkdown)) {
+            $infoPen = New-Object System.Drawing.Pen($WatermarkColor, 1.4)
+            try {
+                $Graphics.DrawEllipse($infoPen, $infoX, $infoY, $infoDiameter, $infoDiameter)
+                $infoFormat = New-Object System.Drawing.StringFormat
+                try {
+                    $infoFormat.Alignment = [System.Drawing.StringAlignment]::Center
+                    $infoFormat.LineAlignment = [System.Drawing.StringAlignment]::Center
+                    $iconDrawBounds = [System.Drawing.RectangleF]::new($infoX, $infoY, $infoDiameter, $infoDiameter)
+                    $Graphics.DrawString('i', $ToolbarInfoFont, $brush, $iconDrawBounds, $infoFormat)
+                } finally { $infoFormat.Dispose() }
+            } finally { $infoPen.Dispose() }
+        }
     } finally {
         $brush.Dispose()
         $format.Dispose()
@@ -196,7 +585,7 @@ function Draw-HCABrandWatermark {
 # Toolbar branding image and border. The logo is expected in the icon folder.
 $ToolbarLogoFile = 'HCA-Toolbar.png'
 $ToolbarLogoPath = Join-Path $IconFolder $ToolbarLogoFile
-$ToolbarBorderColor = [System.Drawing.Color]::FromArgb(3,45,108)
+$ToolbarBorderColor = $ToolbarThemeBorderColor
 $ToolbarBorderWidth = 2
 $buttonToolTip = New-Object System.Windows.Forms.ToolTip
 $buttonToolTip.AutoPopDelay = 8000
@@ -319,14 +708,200 @@ function Start-ToolbarCommand {
     }
 }
 
+# Native Windows monitor positioning. The toolbar uses GetMonitorInfo and
+# SetWindowPos in the same Win32 coordinate space, avoiding discrepancies
+# between Windows Forms layout and the native window rectangle.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class HcaMonitorPosition {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Auto)]
+    public struct MONITORINFO {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromPoint(POINT point, uint flags);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)]
+    public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y,
+        int width, int height, uint flags);
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [DllImport("gdi32.dll", SetLastError=true)]
+    public static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
+    [DllImport("gdi32.dll")]
+    public static extern bool DeleteObject(IntPtr obj);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern int SetWindowRgn(IntPtr hwnd, IntPtr region, bool redraw);
+    public delegate bool EnumWindowsCallback(IntPtr hwnd, IntPtr data);
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr data);
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hwnd,
+        System.Text.StringBuilder text, int maxCount);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    public static string InspectPoint(int x, int y) {
+        POINT p = new POINT(); p.X = x; p.Y = y;
+        IntPtr child = WindowFromPoint(p);
+        if (child == IntPtr.Zero) return "No window at point";
+        // GA_ROOT = 2: attribute nested controls to their top-level owner.
+        IntPtr root = GetAncestor(child, 2);
+        if (root == IntPtr.Zero) root = child;
+        uint pid;
+        GetWindowThreadProcessId(root, out pid);
+        RECT rect;
+        if (!GetWindowRect(root, out rect)) return "GetWindowRect failed";
+        var title = new System.Text.StringBuilder(256);
+        GetWindowText(root, title, title.Capacity);
+        return string.Format("HWND=0x{0:X} PID={1} Visible={2} Rect=({3},{4},{5},{6}) Title='{7}'",
+            root.ToInt64(), pid, IsWindowVisible(root), rect.Left, rect.Top,
+            rect.Right, rect.Bottom, title.ToString().Replace("\r", " ").Replace("\n", " "));
+    }
+
+    public static string[] ListProcessWindows(uint targetPid) {
+        var results = new System.Collections.Generic.List<string>();
+        EnumWindows((hwnd, data) => {
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (pid != targetPid) return true;
+            RECT r;
+            if (!GetWindowRect(hwnd, out r)) return true;
+            var title = new System.Text.StringBuilder(256);
+            GetWindowText(hwnd, title, title.Capacity);
+            string safeTitle = title.ToString().Replace("\r", " ").Replace("\n", " ");
+            results.Add(string.Format(
+                "HWND=0x{0:X} Visible={1} Rect=({2},{3},{4},{5}) Title='{6}'",
+                hwnd.ToInt64(), IsWindowVisible(hwnd),
+                r.Left, r.Top, r.Right, r.Bottom, safeTitle));
+            return true;
+        }, IntPtr.Zero);
+        return results.ToArray();
+    }
+}
+'@
+
+$script:LastMonitorEdgeDiagnostic = ''
+$script:LastWindowDiagnosticSignature = ''
+function Write-ToolbarWindowDiagnostics {
+    param([string]$Reason = 'CHECK')
+    try {
+        $windows = @([HcaMonitorPosition]::ListProcessWindows([uint32]$PID))
+        $signature = $windows -join '|'
+        if ($signature -eq $script:LastWindowDiagnosticSignature -and $Reason -eq 'MONITOR_SYNC') { return }
+        $script:LastWindowDiagnosticSignature = $signature
+        Write-ToolbarLog -Message ("WINDOW_DIAGNOSTICS Reason='{0}' PID={1} WindowCount={2}" -f $Reason, $PID, $windows.Count)
+        foreach ($window in $windows) {
+            Write-ToolbarLog -Message ("WINDOW_DIAGNOSTIC {0}" -f $window)
+        }
+    } catch {
+        Write-ToolbarLog -Level WARNING -Message ("Window diagnostics failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+# Check which top-level window owns pixels immediately inside and outside
+# the docked monitor boundary. Sample after docking, not continuously.
+function Write-ToolbarBoundaryOwners {
+    param([System.Windows.Forms.Screen]$Screen, [string]$Reason = 'DOCKED')
+    try {
+        $bounds = $Screen.Bounds
+        $sampleY = [int]($bounds.Top + [Math]::Min(15, [Math]::Max(1, $ToolbarHeight - 2)))
+        foreach ($offset in @(-3, -1, 0, 1, 3)) {
+            $x = [int]($bounds.Right + $offset)
+            $owner = [HcaMonitorPosition]::InspectPoint($x, $sampleY)
+            Write-ToolbarLog -Message ("BOUNDARY_CHECK Reason='{0}' Monitor='{1}' Right={2} Point=({3},{4}) Offset={5} {6}" -f
+                $Reason, $Screen.DeviceName, $bounds.Right, $x, $sampleY, $offset, $owner)
+        }
+    } catch {
+        Write-ToolbarLog -Level WARNING -Message ("BOUNDARY_CHECK failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+# Apply a native window region in client-independent window coordinates.
+# Windows owns the region after successful SetWindowRgn; do not free it.
+function Set-ToolbarClipRegion {
+    param([System.Windows.Forms.Form]$Form, [bool]$Enable = $true)
+    if ($Form.IsDisposed -or -not $Form.IsHandleCreated) { return }
+    if (-not $Enable) {
+        [void][HcaMonitorPosition]::SetWindowRgn($Form.Handle, [IntPtr]::Zero, $true)
+        return
+    }
+    $windowRect = New-Object HcaMonitorPosition+RECT
+    if (-not [HcaMonitorPosition]::GetWindowRect($Form.Handle, [ref]$windowRect)) { return }
+    $width = $windowRect.Right - $windowRect.Left
+    $height = $windowRect.Bottom - $windowRect.Top
+    if ($width -le 0 -or $height -le 0) { return }
+    $region = [HcaMonitorPosition]::CreateRectRgn(0, 0, $width, $height)
+    if ($region -eq [IntPtr]::Zero) { return }
+    $result = [HcaMonitorPosition]::SetWindowRgn($Form.Handle, $region, $true)
+    if ($result -eq 0) {
+        [void][HcaMonitorPosition]::DeleteObject($region)
+        Write-ToolbarLog -Level WARNING -Message 'CLIP_REGION_FAILED'
+    } else {
+        Write-ToolbarLog -Message ("CLIP_REGION_APPLIED Width={0} Height={1}" -f $width, $height)
+    }
+}
+
 function Set-ToolbarBounds {
     param(
         [System.Windows.Forms.Form]$Form,
         [System.Windows.Forms.Screen]$Screen = [System.Windows.Forms.Screen]::PrimaryScreen
     )
-    # Use monitor bounds, not WorkingArea, to span the entire top edge.
     $bounds = $Screen.Bounds
-    $Form.SetBounds($bounds.Left, $bounds.Top, $bounds.Width, $ToolbarHeight)
+    $point = New-Object HcaMonitorPosition+POINT
+    $point.X = [int]($bounds.Left + [Math]::Floor($bounds.Width / 2))
+    $point.Y = [int]($bounds.Top + [Math]::Floor($bounds.Height / 2))
+    $monitor = [HcaMonitorPosition]::MonitorFromPoint($point, 2)
+    $info = New-Object HcaMonitorPosition+MONITORINFO
+    $info.cbSize = [Runtime.InteropServices.Marshal]::SizeOf([type]'HcaMonitorPosition+MONITORINFO')
+    if ($monitor -eq [IntPtr]::Zero -or
+        -not [HcaMonitorPosition]::GetMonitorInfo($monitor, [ref]$info)) {
+        Write-ToolbarLog -Level WARNING -Message 'Native monitor query failed; using Screen.Bounds.'
+        $Form.SetBounds($bounds.Left, $bounds.Top, $bounds.Width, $ToolbarHeight,
+            [System.Windows.Forms.BoundsSpecified]::All)
+        return
+    }
+    $native = $info.rcMonitor
+    $width = $native.Right - $native.Left
+    $height = [int]$ToolbarHeight
+    if (-not $Form.IsHandleCreated) {
+        $Form.SetBounds($bounds.Left, $bounds.Top, $bounds.Width, $height,
+            [System.Windows.Forms.BoundsSpecified]::All)
+        return
+    }
+    # SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+    $flags = [uint32](0x0004 -bor 0x0010 -bor 0x0200)
+    $ok = [HcaMonitorPosition]::SetWindowPos($Form.Handle, [IntPtr]::Zero,
+        $native.Left, $native.Top, $width, $height, $flags)
+    if (-not $ok) {
+        Write-ToolbarLog -Level WARNING -Message 'Native SetWindowPos failed.'
+        return
+    }
+    Set-ToolbarClipRegion -Form $Form
+    $actual = New-Object HcaMonitorPosition+RECT
+    if ([HcaMonitorPosition]::GetWindowRect($Form.Handle, [ref]$actual)) {
+        $diagnostic = "MONITOR_EDGE Monitor='$($Screen.DeviceName)' Native=($($native.Left),$($native.Top),$($native.Right),$($native.Bottom)) Actual=($($actual.Left),$($actual.Top),$($actual.Right),$($actual.Bottom)) WinForms=($($Form.Left),$($Form.Top),$($Form.Right),$($Form.Bottom))"
+        if ($diagnostic -ne $script:LastMonitorEdgeDiagnostic) {
+            Write-ToolbarLog -Message $diagnostic
+            $script:LastMonitorEdgeDiagnostic = $diagnostic
+        }
+    }
 }
 
 function Get-ScaledImage {
@@ -410,13 +985,28 @@ function Move-ApplicationButtonDrag {
     $point = $flow.PointToClient($mouse)
     $targetOrdinal = 0
 
-    for ($i = 0; $i -lt $appControls.Count; $i++) {
-        $control = $appControls[$i]
-        $centerX = $control.Left + [int]($control.Width / 2)
-        if ($point.X -ge $centerX) {
-            $targetOrdinal = $i + 1
-        } else {
-            break
+    if ($script:TwoRowMode) {
+        $firstRow = if ($appControls.Count -le 40) {
+            [Math]::Min(20, $appControls.Count)
+        } else { [int][Math]::Ceiling($appControls.Count / 2.0) }
+        $secondRow = $appControls.Count - $firstRow
+        $onSecond = ($secondRow -gt 0 -and $point.Y -ge $appControls[$firstRow].Top)
+        $start = if ($onSecond) { $firstRow } else { 0 }
+        $end = if ($onSecond) { $appControls.Count } else { $firstRow }
+        $targetOrdinal = $start
+        for ($i = $start; $i -lt $end; $i++) {
+            $control = $appControls[$i]
+            if ($point.X -ge ($control.Left + [int]($control.Width / 2))) {
+                $targetOrdinal = $i + 1
+            } else { break }
+        }
+    } else {
+        for ($i = 0; $i -lt $appControls.Count; $i++) {
+            $control = $appControls[$i]
+            $centerX = $control.Left + [int]($control.Width / 2)
+            if ($point.X -ge $centerX) {
+                $targetOrdinal = $i + 1
+            } else { break }
         }
     }
 
@@ -439,6 +1029,7 @@ function Move-ApplicationButtonDrag {
     # Application buttons therefore start at child index 2.
     $targetFlowIndex = $targetOrdinal
     [void]$flow.Controls.SetChildIndex($script:DragButton, $targetFlowIndex)
+    if ($script:TwoRowMode) { Update-ApplicationWidths }
     $flow.PerformLayout()
 }
 
@@ -457,6 +1048,7 @@ function Finish-ApplicationButtonDrag {
         # Newly selected buttons are appended by Show-ButtonManager rather than
         # inserted into an existing sequence.
         Save-ToolbarButtonOrder
+        Update-ToolbarDropdown
     }
 
     $script:IsDraggingButton = $false
@@ -505,13 +1097,15 @@ function Enable-RoundedButton {
     $Button.Add_SizeChanged($shape)
     $Button.Add_HandleCreated($shape)
     if ($ShowOutline) {
+        # Capture the active theme's border color for this button.
+        $outlineColor = $ButtonBorderColor
         $paint = {
             param($sender,$e)
             $w = $sender.ClientSize.Width - 2; $h = $sender.ClientSize.Height - 2
             if ($w -lt 4 -or $h -lt 4) { return }
             $d = 2 * [Math]::Min($Radius, [int]([Math]::Min($w,$h) / 2))
             $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 1.2)
+            $pen = New-Object System.Drawing.Pen($outlineColor, 1.2)
             try {
                 $path.AddArc(1,1,$d,$d,180,90)
                 $path.AddArc($w-$d,1,$d,$d,270,90)
@@ -541,11 +1135,11 @@ function New-ToolbarButton {
     $button.Margin = New-Object System.Windows.Forms.Padding(0)
     $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $button.FlatAppearance.BorderSize = 1
-    $button.FlatAppearance.BorderColor = [System.Drawing.Color]::Black
+    $button.FlatAppearance.BorderColor = $ButtonBorderColor
     $button.FlatAppearance.MouseOverBackColor = $HoverColor
     $button.BackColor = $ButtonColor
     $button.ForeColor = $TextColor
-    $button.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $button.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Regular)
     $button.Cursor = [System.Windows.Forms.Cursors]::Hand
     $button.TextImageRelation = [System.Windows.Forms.TextImageRelation]::ImageBeforeText
     $button.ImageAlign = [System.Drawing.ContentAlignment]::MiddleLeft
@@ -639,6 +1233,8 @@ function Show-ButtonManager {
     $manager.MinimizeBox = $false
     $manager.MaximizeBox = $false
     $manager.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $manager.BackColor = $BackColor
+    $manager.ForeColor = $TextColor
 
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
     $layout.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -650,6 +1246,7 @@ function Show-ButtonManager {
     $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
     $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 52)))
     $manager.Controls.Add($layout)
+    $layout.BackColor = $BackColor
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = ('Available applications: {0}' -f $master.Count)
@@ -657,18 +1254,24 @@ function Show-ButtonManager {
     $title.Padding = New-Object System.Windows.Forms.Padding(4,8,0,0)
     $title.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
     $layout.Controls.Add($title, 0, 0)
+    $title.BackColor = $BackColor
+    $title.ForeColor = $TextColor
 
     $hint = New-Object System.Windows.Forms.Label
     $hint.Text = ("Buttons shown on toolbar: {0}.`nMaximum buttons allowed on toolbar: {1}." -f ([Math]::Min($selected.Count, $MaxSelectedButtons)), $MaxSelectedButtons)
     $hint.Dock = [System.Windows.Forms.DockStyle]::Fill
     $hint.Padding = New-Object System.Windows.Forms.Padding(4,0,4,4)
     $layout.Controls.Add($hint, 0, 1)
+    $hint.BackColor = $BackColor
+    $hint.ForeColor = $TextColor
 
     $list = New-Object System.Windows.Forms.CheckedListBox
     $list.Dock = [System.Windows.Forms.DockStyle]::Fill
     $list.IntegralHeight = $false
     $list.CheckOnClick = $true
     $list.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $list.BackColor = $ButtonColor
+    $list.ForeColor = $TextColor
 
     $idByIndex = @{}
     for ($i = 0; $i -lt $master.Count; $i++) {
@@ -691,6 +1294,7 @@ function Show-ButtonManager {
     $listPanel.Padding = New-Object System.Windows.Forms.Padding(0)
     $listPanel.Controls.Add($list)
     $layout.Controls.Add($listPanel, 0, 2)
+    $listPanel.BackColor = $BackColor
 
     $buttonsPanel = New-Object System.Windows.Forms.FlowLayoutPanel
     $buttonsPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -699,6 +1303,7 @@ function Show-ButtonManager {
     $buttonsPanel.WrapContents = $false
     $buttonsPanel.Padding = New-Object System.Windows.Forms.Padding(0,8,0,0)
     $layout.Controls.Add($buttonsPanel, 0, 3)
+    $buttonsPanel.BackColor = $BackColor
 
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = 'Cancel'
@@ -748,7 +1353,10 @@ function Show-ButtonManager {
     foreach ($actionButton in @($cancel, $save, $selectAll, $clearAll)) {
         $actionButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $actionButton.FlatAppearance.BorderSize = 1
-        $actionButton.FlatAppearance.BorderColor = [System.Drawing.Color]::Black
+        $actionButton.FlatAppearance.BorderColor = $ButtonBorderColor
+        $actionButton.FlatAppearance.MouseOverBackColor = $HoverColor
+        $actionButton.BackColor = $ButtonColor
+        $actionButton.ForeColor = $TextColor
     }
 
 
@@ -837,6 +1445,7 @@ function Get-FloatingToolbarWidth {
     $screen = [System.Windows.Forms.Screen]::FromControl($Form)
     $maxWidth = $screen.WorkingArea.Width
 
+    if ($script:TwoRowMode) { return $maxWidth }
     return [Math]::Min([Math]::Max(460, $width), $maxWidth)
 }
 
@@ -894,10 +1503,13 @@ function Stop-ToolbarDrag {
         $script:LastMonitorSignature = ''
         $toolbarGrid.PerformLayout()
         Update-ApplicationWidths
-        Write-ToolbarLog -Message ("Toolbar docked to monitor '{0}' at X={1}, Y={2}, Width={3}." -f $targetScreen.DeviceName, $bounds.Left, $bounds.Top, $bounds.Width)
+        Write-ToolbarLog -Message ("TOOLBAR_DOCKED Monitor='{0}' X={1} Y={2} Width={3} ReservationRequested=True" -f $targetScreen.DeviceName, $bounds.Left, $bounds.Top, $bounds.Width)
     } else {
         $script:ToolbarHasBeenParked = $true
+        Set-ToolbarClipRegion -Form $form -Enable $false
+        Write-ToolbarLog -Message ("TOOLBAR_UNDOCKED Monitor='{0}' X={1} Y={2} Width={3} ReservationReleased=True" -f $targetScreen.DeviceName, $form.Left, $form.Top, $form.Width)
     }
+    Publish-ToolbarReservationState
 }
 
 # -----------------------------
@@ -906,13 +1518,18 @@ function Stop-ToolbarDrag {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = $ToolbarTitle
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+# Prevent WinForms font/DPI autoscaling from expanding the borderless form
+# beyond the monitor width after docking or layout updates.
+$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.ShowInTaskbar = $false
 $form.TopMost = $true
 $form.BackColor = $BackColor
 # No outer horizontal padding. This allows the right-side panel to reach the screen edge.
-$form.Padding = New-Object System.Windows.Forms.Padding(0,5,0,5)
+$form.Padding = if ($script:TwoRowMode) { New-Object System.Windows.Forms.Padding(0,1,0,1) } else { New-Object System.Windows.Forms.Padding(0,5,0,5) }
 $form.AutoSize = $false
+$form.MinimumSize = New-Object System.Drawing.Size(0, 0)
+$form.MaximumSize = New-Object System.Drawing.Size(0, 0)
 
 # Watermark. This is painted on the form background so it remains behind
 # application buttons and the right-side controls.
@@ -921,9 +1538,10 @@ $form.Add_Paint({
     $pen = New-Object System.Drawing.Pen($ToolbarBorderColor, $ToolbarBorderWidth)
     try {
         $half = [float]($ToolbarBorderWidth / 2)
-        $e.Graphics.DrawRectangle($pen, $half, $half,
-            ([float]$sender.ClientSize.Width - $ToolbarBorderWidth),
-            ([float]$sender.ClientSize.Height - $ToolbarBorderWidth))
+        # Draw fully inside the client area (including the stroke thickness).
+        $borderWidth = [Math]::Max(0.0, [float]($sender.ClientSize.Width - $ToolbarBorderWidth - 1))
+        $borderHeight = [Math]::Max(0.0, [float]($sender.ClientSize.Height - $ToolbarBorderWidth - 1))
+        $e.Graphics.DrawRectangle($pen, $half, $half, $borderWidth, $borderHeight)
     } finally { $pen.Dispose() }
 })
 
@@ -950,7 +1568,7 @@ $dragHandle.Controls.Add($dragGrip)
 $flow = New-Object System.Windows.Forms.FlowLayoutPanel
 $flow.Dock = [System.Windows.Forms.DockStyle]::Fill
 $flow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
-$flow.WrapContents = $false
+$flow.WrapContents = $script:TwoRowMode
 $flow.AutoScroll = $false
 $flow.BackColor = $BackColor
 
@@ -969,7 +1587,8 @@ $flow.Add_Paint({
     }
     $remaining = $sender.ClientSize.Width - $rightmost - $sender.Padding.Right
     # Width of HCA + orange symbol + Toolbar, with a little breathing room.
-    $needed = 220
+    $script:ToolbarInfoBounds = [System.Drawing.RectangleF]::Empty
+    $needed = 250
     if ($remaining -ge $needed) {
         $rect = [System.Drawing.RectangleF]::new(
             [float]$rightmost, [float]0,
@@ -980,18 +1599,45 @@ $flow.Add_Paint({
 
 $flow.Padding = New-Object System.Windows.Forms.Padding(6,0,0,0)
 $flow.Margin = New-Object System.Windows.Forms.Padding(0)
+
+# The info icon is painted alongside the watermark; hit-test it on mouse movement.
+$flow.Add_MouseMove({
+    $point = [System.Drawing.PointF]::new([float]$_.X, [float]$_.Y)
+    if (-not $script:ToolbarInfoBounds.IsEmpty -and $script:ToolbarInfoBounds.Contains($point)) {
+        $flow.Cursor = [System.Windows.Forms.Cursors]::Help
+        Show-ToolbarInfoPopup
+    } else {
+        $flow.Cursor = [System.Windows.Forms.Cursors]::Default
+        Hide-ToolbarInfoPopup
+    }
+})
+$flow.Add_MouseLeave({
+    $flow.Cursor = [System.Windows.Forms.Cursors]::Default
+    Hide-ToolbarInfoPopup
+})
+
 # Four exclusive columns: fixed icons, applications, username, and lock/kill.
 $toolbarGrid = New-Object System.Windows.Forms.TableLayoutPanel
 $toolbarGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
 $toolbarGrid.Margin = New-Object System.Windows.Forms.Padding(0)
 $toolbarGrid.Padding = New-Object System.Windows.Forms.Padding(0)
 $toolbarGrid.ColumnCount = 4
-$toolbarGrid.RowCount = 1
-[void]$toolbarGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 64)))
+$toolbarGrid.AutoSize = $false
+$toolbarGrid.GrowStyle = [System.Windows.Forms.TableLayoutPanelGrowStyle]::FixedSize
+$toolbarGrid.MinimumSize = New-Object System.Drawing.Size(0, 0)
+# In 63-pixel two-row mode, keep user and utility icons in row 1.
+# Only the application panel spans both rows.
+$toolbarGrid.RowCount = if ($script:TwoRowMode) { 2 } else { 1 }
+[void]$toolbarGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 74)))
 [void]$toolbarGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 [void]$toolbarGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 260)))
-[void]$toolbarGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 126)))
-[void]$toolbarGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$toolbarGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 116)))
+if ($script:TwoRowMode) {
+    [void]$toolbarGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 33)))
+    [void]$toolbarGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+} else {
+    [void]$toolbarGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+}
 $form.Controls.Add($toolbarGrid)
 $section1 = New-Object System.Windows.Forms.FlowLayoutPanel
 $section1.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -1002,7 +1648,22 @@ $section1.BackColor = $BackColor
 $toolbarGrid.Controls.Add($section1, 0, 0)
 $flow.Dock = [System.Windows.Forms.DockStyle]::Fill
 $flow.Padding = New-Object System.Windows.Forms.Padding(0)
-$toolbarGrid.Controls.Add($flow, 1, 0)
+# Section 2 lives in its own clipped viewport, like a flexible HTML frame.
+# It cannot paint or place buttons over the fixed user/utility sections.
+$appViewport = New-Object System.Windows.Forms.Panel
+$appViewport.Dock = [System.Windows.Forms.DockStyle]::Fill
+$appViewport.Margin = New-Object System.Windows.Forms.Padding(0)
+$appViewport.Padding = New-Object System.Windows.Forms.Padding(0)
+$appViewport.AutoScroll = $false
+$appViewport.BackColor = $BackColor
+$flow.Dock = [System.Windows.Forms.DockStyle]::Fill
+$flow.AutoSize = $false
+$flow.MinimumSize = New-Object System.Drawing.Size(0, 0)
+$appViewport.Controls.Add($flow)
+$toolbarGrid.Controls.Add($appViewport, 1, 0)
+if ($script:TwoRowMode) {
+    $toolbarGrid.SetRowSpan($appViewport, 2)
+}
 $dragHandle.Dock = [System.Windows.Forms.DockStyle]::None
 $dragHandle.Height = 32
 $section1.Controls.Add($dragHandle)
@@ -1010,11 +1671,25 @@ $section1.Controls.Add($dragHandle)
 # Right-side area: LoggedInUser value, Lock icon, Kill icon.
 # FileValuePath is loaded from Config.json ('Logged In User').
 
-$rightPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+# Use fixed cells instead of a FlowLayoutPanel: WinForms can otherwise
+# clip the last icon after a DPI/row-height change.
+$rightPanel = New-Object System.Windows.Forms.TableLayoutPanel
 $rightPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
-$rightPanel.Width = 126
-$rightPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
-$rightPanel.WrapContents = $false
+$rightPanel.ColumnCount = 4
+$rightPanel.RowCount = 1
+$rightPanel.GrowStyle = [System.Windows.Forms.TableLayoutPanelGrowStyle]::FixedSize
+# Column 0 is flexible whitespace. The rightmost columns hold the icons.
+[void]$rightPanel.ColumnStyles.Add(
+    (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))
+)
+foreach ($i in 1..3) {
+    [void]$rightPanel.ColumnStyles.Add(
+        (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 36))
+    )
+}
+[void]$rightPanel.RowStyles.Add(
+    (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))
+)
 $rightPanel.BackColor = [System.Drawing.Color]::Transparent
 $rightPanel.Padding = New-Object System.Windows.Forms.Padding(0)
 $rightPanel.Margin = New-Object System.Windows.Forms.Padding(0)
@@ -1041,7 +1716,7 @@ function New-RightToolbarButton {
     param(
         [string]$Text,
         [string]$IconFile,
-        [int]$Width = 42
+        [int]$Width = 36
     )
 
     $button = New-Object System.Windows.Forms.Button
@@ -1051,7 +1726,7 @@ function New-RightToolbarButton {
     $button.Padding = New-Object System.Windows.Forms.Padding(0)
     $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $button.FlatAppearance.BorderSize = 0
-    $button.FlatAppearance.BorderColor = [System.Drawing.Color]::Black
+    $button.FlatAppearance.BorderColor = $ButtonBorderColor
     $button.FlatAppearance.MouseOverBackColor = $HoverColor
     $button.BackColor = $ButtonColor
     $button.ForeColor = $TextColor
@@ -1075,12 +1750,12 @@ function New-RightToolbarButton {
 
     $button.Add_MouseEnter({ $this.BackColor = $HoverColor })
     $button.Add_MouseLeave({ $this.BackColor = $ButtonColor })
-    Enable-RoundedButton -Button $button -Radius 7 -ShowOutline $false
+    # Utility image buttons remain borderless without a clipping Region.
     return $button
 }
 
 # Password Reset is the first control in Section 4.
-$passwordResetButton = New-RightToolbarButton -Text '' -IconFile '' -Width 42
+$passwordResetButton = New-RightToolbarButton -Text '' -IconFile '' -Width 36
 $passwordResetButton.AccessibleName = 'Password Reset'
 $buttonToolTip.SetToolTip($passwordResetButton, 'Password Reset')
 $passwordIconPath = Join-Path $IconFolder 'password-reset.ico'
@@ -1101,11 +1776,14 @@ if (Test-Path -LiteralPath $passwordIconPath -PathType Leaf) {
 }
 $passwordResetButton.Add_Click({
     Write-ToolbarLog -Message 'BUTTON_CLICK Name=Password Reset'
-    Start-ToolbarCommand -Command 'msedge.exe' -Arguments 'https://passwordreset.app.medcity.net/'
+    Start-ToolbarCommand -Command 'msedge.exe' -Arguments $PasswordResetUrl
 })
-$rightPanel.Controls.Add($passwordResetButton)
+$passwordResetButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$passwordResetButton.Margin = New-Object System.Windows.Forms.Padding(0)
+$passwordColumn = if ($ThirdButtonMode -eq 'None') { 2 } else { 1 }
+$rightPanel.Controls.Add($passwordResetButton, $passwordColumn, 0)
 
-$lockButton = New-RightToolbarButton -Text '' -IconFile 'lock.png' -Width 42
+$lockButton = New-RightToolbarButton -Text '' -IconFile 'lock.png' -Width 36
 $lockButton.AccessibleName = 'Lock Workstation'
 $buttonToolTip.SetToolTip($lockButton, 'Lock Workstation')
 $lockButton.Add_Click({
@@ -1122,15 +1800,26 @@ $lockButton.Add_Click({
         ) | Out-Null
     }
 })
-$rightPanel.Controls.Add($lockButton)
+$lockButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$lockButton.Margin = New-Object System.Windows.Forms.Padding(0)
+$lockColumn = if ($ThirdButtonMode -eq 'None') { 3 } else { 2 }
+$rightPanel.Controls.Add($lockButton, $lockColumn, 0)
 
-$exitToolbarButton = New-RightToolbarButton -Text '' -IconFile 'kill.png' -Width 42
-$exitToolbarButton.AccessibleName = 'Exit Toolbar'
-$buttonToolTip.SetToolTip($exitToolbarButton, 'Exit Toolbar')
-$rightPanel.Controls.Add($exitToolbarButton)
+# Optional third button, always in the rightmost column.
+$exitToolbarButton = $null
+if ($ThirdButtonMode -ne 'None') {
+    $thirdIcon = if ($ThirdButtonMode -eq 'LogOff') { 'LogOff.png' } else { 'kill.png' }
+    $thirdTooltip = if ($ThirdButtonMode -eq 'LogOff') { 'Log Off Windows' } else { 'Exit Toolbar' }
+    $exitToolbarButton = New-RightToolbarButton -Text '' -IconFile $thirdIcon -Width 36
+    $exitToolbarButton.AccessibleName = $thirdTooltip
+    $buttonToolTip.SetToolTip($exitToolbarButton, $thirdTooltip)
+    $exitToolbarButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $exitToolbarButton.Margin = New-Object System.Windows.Forms.Padding(0)
+    $rightPanel.Controls.Add($exitToolbarButton, 3, 0)
+}
 
 # Add the right-side panel after the left Fill panel so it remains at the extreme right.
-$rightPanel.Width = 126
+$rightPanel.Width = 116
 $section4 = $rightPanel
 $toolbarGrid.Controls.Add($rightPanel, 3, 0)
 
@@ -1223,7 +1912,7 @@ $manageButton.BackColor = $BackColor
 $manageButton.ImageAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $manageButton.Margin = New-Object System.Windows.Forms.Padding(0)
 $manageButton.Padding = New-Object System.Windows.Forms.Padding(0)
-#$manageButton.ForeColor = $TextColor
+$manageButton.ForeColor = $TextColor
 $manageButton.Cursor = [System.Windows.Forms.Cursors]::Hand
 
 # Image-only Button Manager control, using icon\ButtonManager.png.
@@ -1241,6 +1930,76 @@ if (Test-Path -LiteralPath $managerIconPath -PathType Leaf) {
 }
 $manageButton.AccessibleName = 'Button Manager'
 $buttonToolTip.SetToolTip($manageButton, 'Manage Toolbar Buttons')
+# Dropdown immediately before the Button Manager icon.
+$script:ToolbarDropdownItems = @()
+$toolbarDropdown = New-Object System.Windows.Forms.Button
+$toolbarDropdown.Text = [string][char]0x25BC
+$toolbarDropdown.Size = New-Object System.Drawing.Size(18,32)
+$toolbarDropdown.Margin = New-Object System.Windows.Forms.Padding(0)
+$toolbarDropdown.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$toolbarDropdown.FlatAppearance.BorderSize = 0
+$toolbarDropdown.BackColor = $BackColor
+$toolbarDropdown.ForeColor = $TextColor
+$toolbarDropdown.Cursor = [System.Windows.Forms.Cursors]::Hand
+$toolbarDropdown.AccessibleName = 'Toolbar buttons dropdown'
+$buttonToolTip.SetToolTip($toolbarDropdown, 'Show all toolbar buttons')
+$section1.Controls.Add($toolbarDropdown)
+
+$toolbarDropdownMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$toolbarDropdownMenu.ShowImageMargin = $false
+$toolbarDropdownMenu.Padding = New-Object System.Windows.Forms.Padding(0)
+$toolbarDropdownList = New-Object System.Windows.Forms.ListBox
+$toolbarDropdownList.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$toolbarDropdownList.IntegralHeight = $false
+$toolbarDropdownList.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$toolbarDropdownList.BackColor = $ButtonColor
+$toolbarDropdownList.ForeColor = $TextColor
+$toolbarDropdownList.HorizontalScrollbar = $false
+$toolbarDropdownList.SelectionMode = [System.Windows.Forms.SelectionMode]::One
+$toolbarDropdownHost = New-Object System.Windows.Forms.ToolStripControlHost($toolbarDropdownList)
+$toolbarDropdownHost.Margin = New-Object System.Windows.Forms.Padding(2)
+$toolbarDropdownHost.Padding = New-Object System.Windows.Forms.Padding(0)
+[void]$toolbarDropdownMenu.Items.Add($toolbarDropdownHost)
+
+function Update-ToolbarDropdown {
+    $script:ToolbarDropdownItems = @($flow.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $null -ne $_.Tag -and $null -ne $_.Tag.Id })
+    $toolbarDropdownList.BeginUpdate()
+    try {
+        $toolbarDropdownList.Items.Clear()
+        foreach ($item in $script:ToolbarDropdownItems) {
+            [void]$toolbarDropdownList.Items.Add([string]$item.Tag.Name)
+        }
+    } finally { $toolbarDropdownList.EndUpdate() }
+    $maxRows = 12
+    $visibleRows = [Math]::Max(1, [Math]::Min($maxRows, $script:ToolbarDropdownItems.Count))
+    $toolbarDropdownList.Size = New-Object System.Drawing.Size(240, ($visibleRows * $toolbarDropdownList.ItemHeight + 4))
+    $toolbarDropdownHost.Size = $toolbarDropdownList.Size
+}
+$toolbarDropdown.Add_Click({
+    Update-ToolbarDropdown
+    if ($script:ToolbarDropdownItems.Count -eq 0) { return }
+    $toolbarDropdownList.ClearSelected()
+    $toolbarDropdownMenu.Show($toolbarDropdown, (New-Object System.Drawing.Point(0, $toolbarDropdown.Height)))
+})
+$toolbarDropdownList.Add_MouseClick({
+    $index = $toolbarDropdownList.IndexFromPoint($_.Location)
+    if ($index -lt 0 -or $index -ge $script:ToolbarDropdownItems.Count) { return }
+    $button = $script:ToolbarDropdownItems[$index]
+    $toolbarDropdownMenu.Close()
+    Write-ToolbarLog -Message ("DROPDOWN_CLICK Name='{0}' Id='{1}'" -f ([string]$button.Tag.Name), ([string]$button.Tag.Id))
+    $button.PerformClick()
+})
+$toolbarDropdownList.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $toolbarDropdownMenu.Close(); return }
+    if ($_.KeyCode -ne [System.Windows.Forms.Keys]::Enter) { return }
+    $index = $toolbarDropdownList.SelectedIndex
+    if ($index -lt 0 -or $index -ge $script:ToolbarDropdownItems.Count) { return }
+    $button = $script:ToolbarDropdownItems[$index]
+    $toolbarDropdownMenu.Close()
+    $button.PerformClick()
+    $_.Handled = $true
+})
+
 $section1.Controls.Add($manageButton)
 
 # Section 3 sizes itself to the displayed value, leaving more room for apps.
@@ -1248,7 +2007,12 @@ function Update-UserSectionWidth {
     if ($null -eq $fileValueLabel -or $null -eq $toolbarGrid) { return }
     $textWidth = [System.Windows.Forms.TextRenderer]::MeasureText(
         [string]$fileValueLabel.Text, $fileValueLabel.Font).Width
-    $newWidth = [Math]::Min(260, [Math]::Max(110, $textWidth + 20))
+    $fixedLeft = 74
+    $fixedRight = 116
+    # On smaller laptop displays, protect space for the application frame.
+    $maxUserWidth = [Math]::Max(60, [Math]::Min(260,
+        $toolbarGrid.ClientSize.Width - $fixedLeft - $fixedRight - 160))
+    $newWidth = [Math]::Min($maxUserWidth, [Math]::Max(110, $textWidth + 20))
     if ([int]$toolbarGrid.ColumnStyles[2].Width -ne $newWidth) {
         $toolbarGrid.ColumnStyles[2].Width = $newWidth
         $toolbarGrid.PerformLayout()
@@ -1272,6 +2036,53 @@ function Update-ApplicationWidths {
         if ($apps.Count -eq 0) { return }
         $usable = [Math]::Max(0, $flow.ClientSize.Width - $flow.Padding.Horizontal - 6)
         if ($usable -le 0) { return }
+        if ($script:TwoRowMode) {
+            # Up to 20 on row 1; then row 2. Above 40, split evenly
+            # with the extra button on row 1.
+            $row1Count = if ($apps.Count -le 40) {
+                [Math]::Min(20, $apps.Count)
+            } else { [int][Math]::Ceiling($apps.Count / 2.0) }
+            $row2Count = $apps.Count - $row1Count
+            $flow.SuspendLayout()
+            try {
+                for ($i = 0; $i -lt $apps.Count; $i++) {
+                    $flow.SetFlowBreak($apps[$i], ($row2Count -gt 0 -and $i -eq ($row1Count - 1)))
+                }
+                for ($row = 0; $row -lt 2; $row++) {
+                    $start = if ($row -eq 0) { 0 } else { $row1Count }
+                    $count = if ($row -eq 0) { $row1Count } else { $row2Count }
+                    if ($count -eq 0) { continue }
+                    $preferred = @()
+                    for ($i = $start; $i -lt ($start + $count); $i++) {
+                        $preferred += [Math]::Max(92, ([string]$apps[$i].Tag.Name).Length * 8 + 42)
+                    }
+                    $sum = 0
+                    foreach ($w in $preferred) { $sum += $w }
+                    # More than 40: equal widths within each row. Otherwise
+                    # retain name-based widths, scaling only if needed to fit.
+                    $equal = ($apps.Count -gt 40)
+                    $remaining = $usable
+                    for ($j = 0; $j -lt $count; $j++) {
+                        $i = $start + $j
+                        if ($equal) {
+                            $w = [int][Math]::Floor($usable / $count) + [int]($j -lt ($usable % $count))
+                        } elseif ($sum -le $usable) {
+                            $w = $preferred[$j]
+                        } elseif ($j -eq ($count - 1)) {
+                            $w = $remaining
+                        } else {
+                            $w = [int][Math]::Floor($usable * $preferred[$j] / $sum)
+                        }
+                        $w = [Math]::Max(1, [int]$w)
+                        $apps[$i].Width = $w
+                        $apps[$i].AutoEllipsis = $false
+                        Set-SingleLineButtonText -Button $apps[$i]
+                        $remaining -= $w
+                    }
+                }
+            } finally { $flow.ResumeLayout($true) }
+            return
+        }
         $preferred = @($apps | ForEach-Object { [Math]::Max(92, ([string]$_.Tag.Name).Length * 8 + 42) })
         $widths = New-Object 'System.Collections.Generic.List[int]'
         if ($apps.Count -gt $EqualWidthThreshold) {
@@ -1322,6 +2133,7 @@ function Rebuild-ToolbarButtons {
         }
     } finally { $flow.ResumeLayout($true) }
     Update-ApplicationWidths
+    Update-ToolbarDropdown
     $flow.Invalidate()
     Write-ToolbarLog -Message ("Toolbar rebuilt with {0} application button(s)." -f $selectedItems.Count)
 
@@ -1353,23 +2165,61 @@ $notifyIcon.Text = $ToolbarTitle
 $notifyIcon.Visible = $true
 
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
-$trayShow = $trayMenu.Items.Add('Show / Hide Toolbar')
+$trayShow = $trayMenu.Items.Add('Hide Toolbar')
 $trayManage = $trayMenu.Items.Add('Manage Buttons')
 $trayExit = $trayMenu.Items.Add('Exit')
-$trayShow.Add_Click({ $form.Visible = -not $form.Visible })
+$trayShow.Add_Click({
+    # The tray menu uses the same auto-hide state as the toolbar context menu.
+    Set-ToolbarAutoHideState -Hide (-not $script:ToolbarAutoHidden)
+})
 $trayManage.Add_Click({ Show-ButtonManager -Owner $form -OnSaved { Rebuild-ToolbarButtons } })
 $trayExit.Add_Click({ $notifyIcon.Visible = $false; $notifyIcon.Dispose(); $form.Close() })
 $notifyIcon.ContextMenuStrip = $trayMenu
-$notifyIcon.Add_DoubleClick({ $form.Visible = -not $form.Visible; if ($form.Visible) { $form.Activate() } })
-
-$exitToolbarButton.Add_Click({
-    Write-ToolbarLog -Message 'BUTTON_CLICK Name=Kill Toolbar'
-    if ($notifyIcon) {
-        $notifyIcon.Visible = $false
-        $notifyIcon.Dispose()
-    }
-    $form.Close()
+$notifyIcon.Add_DoubleClick({
+    Set-ToolbarAutoHideState -Hide (-not $script:ToolbarAutoHidden)
+    if (-not $script:ToolbarAutoHidden) { $form.Activate() }
 })
+
+if ($ThirdButtonMode -eq 'Kill') {
+    $exitToolbarButton.Add_Click({
+        Write-ToolbarLog -Message 'BUTTON_CLICK Name=Kill Toolbar'
+        if ($notifyIcon) {
+            $notifyIcon.Visible = $false
+            $notifyIcon.Dispose()
+        }
+        $form.Close()
+    })
+} elseif ($ThirdButtonMode -eq 'LogOff') {
+    $exitToolbarButton.Add_Click({
+        Write-ToolbarLog -Message 'BUTTON_CLICK Name=LogOff'
+        $proceed = $true
+        if ($LogOffConfirmation -eq 'Yes') {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                'Do you want to LogOff?',
+                'Confirm LogOff',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question
+            )
+            $proceed = ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+        }
+        if ($proceed) {
+            Write-ToolbarLog -Message ("LOGOFF_REQUESTED ConfirmationSetting='{0}'" -f $LogOffConfirmation)
+            try {
+                Start-Process -FilePath 'shutdown.exe' -ArgumentList '/l' -ErrorAction Stop | Out-Null
+            } catch {
+                Write-ToolbarLog -Level ERROR -Message ("Windows logoff failed: {0}" -f $_.Exception.Message)
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Could not log off Windows.`n$($_.Exception.Message)",
+                    'HCA Toolbar',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+            }
+        } else {
+            Write-ToolbarLog -Message 'LOGOFF_CANCELLED'
+        }
+    })
+}
 
 # Drag events are limited to the dedicated handle so application buttons keep
 # their normal click behavior.
@@ -1379,23 +2229,114 @@ $dragHandle.Add_MouseUp({ Stop-ToolbarDrag })
 $dragGrip.Add_MouseDown({ Start-ToolbarDrag -EventArgs $_ })
 $dragGrip.Add_MouseMove({ Move-ToolbarDrag })
 $dragGrip.Add_MouseUp({ Stop-ToolbarDrag })
+# Auto-hide: the form remains alive and slides just above its docked monitor.
+# Moving the pointer to the top edge temporarily reveals it; Unhide pins it open.
+$script:ToolbarAutoHidden = $false
+$script:ToolbarPeekVisible = $false
+$script:ToolbarLastHover = [DateTime]::MinValue
+$toolbarRightClickMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$toolbarHideItem = $toolbarRightClickMenu.Items.Add('Hide Toolbar')
+$toolbarUnhideItem = $toolbarRightClickMenu.Items.Add('Unhide Toolbar')
+$toolbarUnhideItem.Visible = $false
+
+# When the third utility button is LogOff or None, offer an exit action
+# on the toolbar's existing right-click menu.
+if ($ThirdButtonMode -ne 'Kill') {
+    [void]$toolbarRightClickMenu.Items.Add(
+        (New-Object System.Windows.Forms.ToolStripSeparator)
+    )
+    $toolbarKillLaunchpadItem = $toolbarRightClickMenu.Items.Add('Kill Launchpad')
+    $toolbarKillLaunchpadItem.Add_Click({
+        Write-ToolbarLog -Message 'CONTEXT_MENU_CLICK Name=Kill Launchpad'
+        # Closing the form invokes its existing cleanup handlers and releases
+        # the toolbar's single-instance mutex.
+        $form.Close()
+    })
+}
+function Set-ToolbarAutoHideState {
+    param([bool]$Hide)
+    $script:ToolbarAutoHidden = $Hide
+    Publish-ToolbarReservationState
+    $script:ToolbarPeekVisible = $false
+    $toolbarHideItem.Visible = -not $Hide
+    $toolbarUnhideItem.Visible = $Hide
+    $trayShow.Text = if ($Hide) { 'Unhide Toolbar' } else { 'Hide Toolbar' }
+    if ($Hide) {
+        $form.Top = $script:DockedScreen.Bounds.Top - $form.Height + 1
+        Write-ToolbarLog -Message 'TOOLBAR_HIDDEN Reason=AutoHide ReservationReleased=True'
+    } else {
+        $form.Top = $script:DockedScreen.Bounds.Top
+        Write-ToolbarLog -Message 'TOOLBAR_UNHIDDEN Reason=AutoHide ReservationRequested=True'
+    }
+}
+$toolbarHideItem.Add_Click({ Set-ToolbarAutoHideState -Hide $true })
+$toolbarUnhideItem.Add_Click({ Set-ToolbarAutoHideState -Hide $false })
+# Context menus on empty toolbar surfaces; keep existing button right-click actions.
+foreach ($surface in @($form, $toolbarGrid, $appViewport, $flow, $section1, $dragHandle, $dragGrip)) {
+    $surface.ContextMenuStrip = $toolbarRightClickMenu
+}
+$autoHideTimer = New-Object System.Windows.Forms.Timer
+$autoHideTimer.Interval = 100
+$autoHideTimer.Add_Tick({
+    if (-not $script:ToolbarAutoHidden -or $form.IsDisposed) { return }
+    $pointer = [System.Windows.Forms.Control]::MousePosition
+    $screenBounds = $script:DockedScreen.Bounds
+    $atTop = ($pointer.X -ge $screenBounds.Left -and $pointer.X -lt $screenBounds.Right -and
+              $pointer.Y -ge $screenBounds.Top -and $pointer.Y -le ($screenBounds.Top + 2))
+    if (-not $script:ToolbarPeekVisible -and $atTop) {
+        $form.Top = $screenBounds.Top
+        $script:ToolbarPeekVisible = $true
+        $script:ToolbarLastHover = [DateTime]::Now
+    }
+    if ($script:ToolbarPeekVisible) {
+        $within = $form.Bounds.Contains($pointer)
+        if ($within -or $toolbarRightClickMenu.Visible -or $toolbarDropdownMenu.Visible) {
+            $script:ToolbarLastHover = [DateTime]::Now
+        } elseif (([DateTime]::Now - $script:ToolbarLastHover).TotalMilliseconds -gt 650) {
+            $form.Top = $screenBounds.Top - $form.Height + 1
+            $script:ToolbarPeekVisible = $false
+        }
+    }
+})
+$autoHideTimer.Start()
+
 $form.Add_MouseMove({ Move-ToolbarDrag })
 $form.Add_MouseUp({ Stop-ToolbarDrag })
 $form.Add_Resize({ $form.Invalidate(); Update-ApplicationWidths })
 $flow.Add_SizeChanged({ Update-ApplicationWidths; $flow.Invalidate() })
+$appViewport.Add_SizeChanged({ Update-ApplicationWidths })
 
 # Refresh the four-column layout after the window handle exists. This fixes
 # occasional startup clipping of the last (Kill) icon.
 function Refresh-ToolbarLayout {
     if ($form.IsDisposed -or -not $form.IsHandleCreated) { return }
     try {
-        # Section 4 contains three 42-pixel icon buttons.
-        $toolbarGrid.ColumnStyles[3].Width = 126
-        $rightPanel.MinimumSize = New-Object System.Drawing.Size(126, 0)
+        # Section 4 contains three 36-pixel icon buttons plus 8 pixels of right padding.
+        $toolbarGrid.ColumnStyles[3].Width = 116
+        $rightPanel.MinimumSize = New-Object System.Drawing.Size(0, 0)
         $toolbarGrid.PerformLayout()
+        $appViewport.PerformLayout()
+        $flow.PerformLayout()
         $rightPanel.PerformLayout()
+        Update-UserSectionWidth
+        $utilityNames = if ($ThirdButtonMode -eq 'None') { 'Password Reset, Lock' } else { "Password Reset, Lock, $ThirdButtonMode" }
+        Write-ToolbarLog -Message (
+            "UTILITY_LAYOUT Mode='{0}' Buttons='{1}' GridWidth={2} PanelWidth={3} RightmostButtonRight={4}" -f
+            $ThirdButtonMode, $utilityNames, $toolbarGrid.ColumnStyles[3].Width,
+            $rightPanel.ClientSize.Width,
+            $(if ($exitToolbarButton) { $exitToolbarButton.Right } else { $lockButton.Right })
+        )
         Update-ApplicationWidths
         $form.Invalidate($true)
+        $viewportRect = $appViewport.RectangleToScreen($appViewport.ClientRectangle)
+        $rightRect = $rightPanel.RectangleToScreen($rightPanel.ClientRectangle)
+        Write-ToolbarLog -Message ("RESPONSIVE_LAYOUT Form=({0},{1},{2},{3}) LeftWidth={4} AppViewport=({5},{6},{7},{8}) UserWidth={9} Utility=({10},{11},{12},{13})" -f
+            $form.Left, $form.Top, $form.Width, $form.Height,
+            $toolbarGrid.ColumnStyles[0].Width,
+            $viewportRect.Left, $viewportRect.Top, $viewportRect.Width, $viewportRect.Height,
+            $toolbarGrid.ColumnStyles[2].Width,
+            $rightRect.Left, $rightRect.Top, $rightRect.Width, $rightRect.Height)
+
     } catch {
         Write-ToolbarLog -Level WARNING -Message ("Toolbar layout refresh failed: {0}" -f $_.Exception.Message)
     }
@@ -1406,6 +2347,15 @@ $script:StartupLayoutTimer.Interval = 500
 $script:StartupLayoutTimer.Add_Tick({
     $script:StartupLayoutTimer.Stop()
     Refresh-ToolbarLayout
+    if (-not $script:ToolbarHasBeenParked -and -not $script:ToolbarAutoHidden) {
+        Set-ToolbarBounds -Form $form -Screen $script:DockedScreen
+    }
+    Write-ToolbarWindowDiagnostics -Reason 'STARTUP_DELAYED'
+    if (-not $script:ToolbarHasBeenParked) {
+        Write-ToolbarBoundaryOwners -Screen $script:DockedScreen -Reason 'STARTUP_DELAYED'
+    }
+    # Re-publish only after WinForms has completed the delayed layout.
+    Publish-ToolbarReservationState
 })
 $form.Add_Shown({
     if (-not $script:ToolbarHasBeenParked) {
@@ -1413,6 +2363,13 @@ $form.Add_Shown({
     }
     Refresh-ToolbarLayout
     Sync-ToolbarMonitor
+    # Apply the configured startup state after WinForms has created the form.
+    # Keep the form running so the tray icon and top-edge auto-hide still work.
+    if ($script:StartToolbarHidden) {
+        Set-ToolbarAutoHideState -Hide $true
+    }
+    # Form.Visible is now reliable; the previous pre-Run publish was false.
+    Publish-ToolbarReservationState
     $script:StartupLayoutTimer.Start()
 })
 # Re-query Screen.AllScreens rather than holding on to an obsolete Screen object.
@@ -1420,7 +2377,7 @@ $form.Add_Shown({
 # reconnected, rearranged, or its resolution changes.
 $script:LastMonitorSignature = ''
 function Sync-ToolbarMonitor {
-    if ($form.IsDisposed -or -not $form.IsHandleCreated -or $script:IsDraggingToolbar) { return }
+    if ($form.IsDisposed -or -not $form.IsHandleCreated -or $script:IsDraggingToolbar -or $script:ToolbarAutoHidden) { return }
 
     $screens = @([System.Windows.Forms.Screen]::AllScreens)
     if ($screens.Count -eq 0) { return }
@@ -1448,7 +2405,9 @@ function Sync-ToolbarMonitor {
             Set-ToolbarBounds -Form $form -Screen $live
             $toolbarGrid.PerformLayout()
             Refresh-ToolbarLayout
-            Write-ToolbarLog -Message ("Monitor layout synchronized: {0}, X={1}, Y={2}, Width={3}, Height={4}." -f $live.DeviceName, $bounds.Left, $bounds.Top, $bounds.Width, $ToolbarHeight)
+            Write-ToolbarLog -Message ("Monitor layout synchronized: {0}, X={1}, Y={2}, Width={3}, Height={4}, ActualRight={5}, MonitorRight={6}, NativeBounds=True." -f $live.DeviceName, $bounds.Left, $bounds.Top, $bounds.Width, $ToolbarHeight, $form.Right, $bounds.Right)
+            Write-ToolbarWindowDiagnostics -Reason 'MONITOR_SYNC'
+            Write-ToolbarBoundaryOwners -Screen $live -Reason 'MONITOR_SYNC'
         }
     } else {
         # A parked/floating toolbar should not jump back to the top on a
@@ -1477,11 +2436,15 @@ Set-ToolbarBounds -Form $form -Screen $script:DockedScreen
 $toolbarGrid.PerformLayout()
 Rebuild-ToolbarButtons
 $form.Add_FormClosed({
+    Remove-ToolbarVisibilityState
     Write-ToolbarLog -Message 'Toolbar is closing.'
     $script:StartupLayoutTimer.Stop()
     $script:StartupLayoutTimer.Dispose()
     $screenTimer.Stop()
     $screenTimer.Dispose()
+    $autoHideTimer.Stop()
+    $autoHideTimer.Dispose()
+    $toolbarRightClickMenu.Dispose()
     if ($fileValueTimer) {
         $fileValueTimer.Stop()
         $fileValueTimer.Dispose()
@@ -1490,9 +2453,21 @@ $form.Add_FormClosed({
         $notifyIcon.Visible = $false
         $notifyIcon.Dispose()
     }
+    if ($script:ToolbarInfoToolTip) { $script:ToolbarInfoToolTip.Dispose() }
     if ($buttonToolTip) {
         $buttonToolTip.Dispose()
     }
 })
 
-[System.Windows.Forms.Application]::Run($form)
+try {
+    # Do not publish before Application.Run: Form.Visible is false here.
+    [System.Windows.Forms.Application]::Run($form)
+} finally {
+    Remove-ToolbarVisibilityState
+    if ($script:ToolbarOwnsMutex -and $script:ToolbarInstanceMutex) {
+        try { $script:ToolbarInstanceMutex.ReleaseMutex() } catch {}
+    }
+    if ($script:ToolbarInstanceMutex) {
+        $script:ToolbarInstanceMutex.Dispose()
+    }
+}
