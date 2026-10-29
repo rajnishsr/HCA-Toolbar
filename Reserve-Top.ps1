@@ -1,4 +1,45 @@
-﻿#requires -Version 5.1
+﻿# Configure DPI awareness before Windows Forms creates any window handles.
+# PS2EXE may set process DPI awareness through its embedded manifest already.
+# In that case ERROR_ACCESS_DENIED means the existing process setting is locked.
+$script:DpiAwarenessResult = 'Not attempted'
+if (-not ('HcaEarlyDpiAwareness' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class HcaEarlyDpiAwareness {
+    [DllImport("user32.dll", EntryPoint="SetProcessDpiAwarenessContext", SetLastError=true)]
+    private static extern bool SetContext(IntPtr value);
+    [DllImport("shcore.dll", EntryPoint="SetProcessDpiAwareness", PreserveSig=true)]
+    private static extern int SetAwareness(int awareness);
+    [DllImport("user32.dll", EntryPoint="SetProcessDPIAware", SetLastError=true)]
+    private static extern bool SetLegacy();
+    public static string Initialize() {
+        try {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            if (SetContext(new IntPtr(-4))) return "PerMonitorV2";
+            int error = Marshal.GetLastWin32Error();
+            if (error == 5) return "Already configured by host or manifest (error 5)";
+        } catch (EntryPointNotFoundException) {}
+          catch (DllNotFoundException) {}
+        try {
+            // PROCESS_PER_MONITOR_DPI_AWARE = 2
+            int hr = SetAwareness(2);
+            if (hr == 0) return "PerMonitorV1";
+            if ((uint)hr == 0x80070005) return "Already configured by host or manifest (E_ACCESSDENIED)";
+        } catch (EntryPointNotFoundException) {}
+          catch (DllNotFoundException) {}
+        try {
+            if (SetLegacy()) return "SystemDpiAware";
+        } catch (EntryPointNotFoundException) {}
+          catch (DllNotFoundException) {}
+        return "Could not change process DPI awareness";
+    }
+}
+'@
+}
+$script:DpiAwarenessResult = [HcaEarlyDpiAwareness]::Initialize()
+
+#requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -72,19 +113,19 @@ try {
     }
     $settings = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop |
         ConvertFrom-Json -ErrorAction Stop
-    $entry = @($settings.Config | Where-Object { $_.Name -eq 'Top Space for Toolbar' })
+    $entry = @($settings.Config | Where-Object { $_.Name -eq 'Rows' })
     if ($entry.Count -ne 1) {
-        throw "Expected exactly one 'Top Space for Toolbar' entry; found $($entry.Count)."
+        throw "Expected exactly one 'Rows' entry; found $($entry.Count)."
     }
-    $heightValue = 0
-    if (-not [int]::TryParse([string]$entry[0].Value, [ref]$heightValue) -or
-        $heightValue -le 0) {
-        throw "'Top Space for Toolbar' must be a positive whole number."
+    [int]$rowCount = 0
+    if (-not [int]::TryParse(([string]$entry[0].Value).Trim(), [ref]$rowCount) -or
+        $rowCount -notin @(1, 2)) {
+        throw "'Rows' must be 1 or 2."
     }
-    $PinnedHeight = $heightValue
-    $ConfigHeightStatus = "Loaded PinnedHeight=$PinnedHeight from $ConfigPath"
+    $PinnedHeight = if ($rowCount -eq 1) { 45 } else { 66 }
+    $ConfigHeightStatus = "Loaded Rows=$rowCount; PinnedHeight=$PinnedHeight from $ConfigPath"
 } catch {
-    $ConfigHeightStatus = "Unable to load toolbar height from $ConfigPath; using fallback 45. $($_.Exception.Message)"
+    $ConfigHeightStatus = "Unable to load toolbar height from $ConfigPath; using fallback 45 (Rows=1). $($_.Exception.Message)"
 }
 
 # Process exclusions from Config.json (comma-separated executable names).
@@ -119,7 +160,27 @@ $IgnoreMinimizedWindows = $true
 $VerboseOutput = $false
 
 # How often to check for newly opened or repositioned windows (milliseconds)
-$MonitorIntervalMilliseconds = 5000
+$MonitorIntervalMilliseconds = 750
+
+# The toolbar publishes whether the desktop space should be reserved.
+$script:VisibilityStateFile = Join-Path (Join-Path $AppDirectory 'logs') 'ToolbarVisibility.json'
+$script:ReservationSuspended = $false
+function Test-ToolbarReservationRequested {
+    param([int]$ToolbarPid)
+    try {
+        if (-not (Test-Path -LiteralPath $script:VisibilityStateFile -PathType Leaf)) {
+            return $true  # Backward-compatible if running an older toolbar.
+        }
+        $state = Get-Content -LiteralPath $script:VisibilityStateFile -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        if ([int]$state.ProcessId -ne $ToolbarPid) {
+            return $true  # Ignore a stale signal from a different process.
+        }
+        return ($state.ReserveSpace -eq $true)
+    } catch {
+        return $true
+    }
+}
 
 
 
@@ -197,6 +258,7 @@ function Write-Log {
 
 Initialize-Logging
 Write-Log -Message 'Reserve-Top starting.'
+Write-Log -Message ("DPI_AWARENESS Startup={0}" -f $script:DpiAwarenessResult)
 Write-Log -Message $ConfigHeightStatus
 Write-Log -Message $ConfigExclusionStatus
 Write-Log -Message ("Actual ConfigPath={0}; LogDirectory={1}; ScriptPath={2}" -f $ConfigPath, $LogDirectory, $AppDirectory)
@@ -616,6 +678,31 @@ $TopMostFlags =
     [ReserveTopWin32ChromiumV2]::SWP_NOMOVE -bor
     [ReserveTopWin32ChromiumV2]::SWP_NOACTIVATE
 
+# Verify the toolbar geometry only while its reservation is active.
+# This does not attempt to fix compositor or DPI rendering artifacts.
+function Assert-PinnedToolbarBounds {
+    if ($script:PinnedHwnd -eq [IntPtr]::Zero) { return }
+    $screen = [System.Windows.Forms.Screen]::FromHandle($script:PinnedHwnd)
+    $bounds = $screen.Bounds
+    $rect = Get-WindowRectangle -Handle $script:PinnedHwnd
+    if ($null -eq $rect) { return }
+    $expectedWidth = [int]$bounds.Width
+    $expectedHeight = [int]$PinnedHeight
+    if ($rect.Left -eq $bounds.Left -and $rect.Top -eq $bounds.Top -and
+        $rect.Width -eq $expectedWidth -and $rect.Height -eq $expectedHeight) {
+        return
+    }
+    $ok = [ReserveTopWin32ChromiumV2]::MoveWindow(
+        $script:PinnedHwnd, $bounds.Left, $bounds.Top,
+        $expectedWidth, $expectedHeight, $true
+    )
+    $after = Get-WindowRectangle -Handle $script:PinnedHwnd
+    Write-Log -Message ("TOOLBAR_BOUNDS_ENFORCED Monitor='{0}' Old=({1},{2},{3},{4}) Expected=({5},{6},{7},{8}) Success={9} Actual=({10},{11},{12},{13})" -f
+        $screen.DeviceName, $rect.Left, $rect.Top, $rect.Width, $rect.Height,
+        $bounds.Left, $bounds.Top, $expectedWidth, $expectedHeight, $ok,
+        $after.Left, $after.Top, $after.Width, $after.Height)
+}
+
 function Initialize-PinnedApplication {
     if ($script:PinnedHwnd -eq [IntPtr]::Zero) { return $false }
 
@@ -636,10 +723,8 @@ function Initialize-PinnedApplication {
     $script:ApplicationBottom = $WorkingArea.Bottom
     $script:MaximumApplicationHeight = $WorkingArea.Height - $PinnedHeight
 
-    [void][ReserveTopWin32ChromiumV2]::MoveWindow(
-        $script:PinnedHwnd, $PinnedRect.Left, $WorkingArea.Top,
-        $PinnedRect.Width, $PinnedHeight, $true
-    )
+    # Use the target monitor's full width, not the toolbar's previous width.
+    Assert-PinnedToolbarBounds
 
     [void][ReserveTopWin32ChromiumV2]::SetWindowPos(
         $script:PinnedHwnd, [ReserveTopWin32ChromiumV2]::HWND_TOPMOST,
@@ -652,7 +737,12 @@ function Initialize-PinnedApplication {
 }
 
 if ($script:PinnedApplicationPresent) {
-    [void](Initialize-PinnedApplication)
+    if (Test-ToolbarReservationRequested -ToolbarPid $script:PinnedPid) {
+        [void](Initialize-PinnedApplication)
+    } else {
+        $script:ReservationSuspended = $true
+        Write-Log -Message 'Toolbar initially hidden; reservation will begin when unhidden.'
+    }
 }
 
 
@@ -1102,6 +1192,7 @@ $ResizeCallback =
         if ($Result) {
 
             Write-Log -Message ("  Geometry: ({0},{1}) {2}x{3} -> ({4},{5}) {6}x{7}" -f $OriginalLeft,$OriginalTop,$OriginalWidth,$OriginalHeight,$OriginalLeft,$NewTop,$OriginalWidth,$NewHeight)
+            Write-Log -Message ("WINDOW_ADJUSTED Process='{0}' Title='{1}' Handle='{2}' Monitor='{3}' Old=({4},{5},{6},{7}) New=({8},{9},{10},{11}) Action='{12}'" -f $ProcessInfo.ProcessName, ($Title -replace "'", "''"), $hWnd, $script:TargetScreen.DeviceName, $OriginalLeft, $OriginalTop, $OriginalWidth, $OriginalHeight, $OriginalLeft, $NewTop, $OriginalWidth, $NewHeight, $(if ($HeightChanged) { 'RESIZED' } else { 'MOVED' }))
 
             if ($HeightChanged) {
                 $script:WindowsResized++
@@ -1171,9 +1262,16 @@ function Restore-ManagedWindows {
             }
 
             $Flags = [ReserveTopWin32ChromiumV2]::SWP_NOACTIVATE -bor [ReserveTopWin32ChromiumV2]::SWP_SHOWWINDOW
-            [void][ReserveTopWin32ChromiumV2]::SetWindowPos(
+            $restored = [ReserveTopWin32ChromiumV2]::SetWindowPos(
                 $hWnd, [IntPtr]::Zero, $Rect.Left, $NewTop, $Rect.Width, $NewHeight, $Flags
             )
+            $processInfo = Get-WindowProcessInfo -Handle $hWnd
+            $processName = if ($null -ne $processInfo) { [string]$processInfo.ProcessName } else { 'Unknown' }
+            if ($restored) {
+                Write-Log -Message ("WINDOW_RESTORED Process='{0}' Title='{1}' Handle='{2}' Monitor='{3}' Old=({4},{5},{6},{7}) New=({8},{9},{10},{11}) Action='{12}'" -f $processName, ($Title -replace "'", "''"), $hWnd, $script:ReleaseScreen.DeviceName, $Rect.Left, $Rect.Top, $Rect.Width, $Rect.Height, $Rect.Left, $NewTop, $Rect.Width, $NewHeight, $(if ($NewHeight -ne $Rect.Height) { 'RESIZED' } else { 'MOVED' }))
+            } else {
+                Write-Log -Level WARN -Message ("WINDOW_RESTORE_FAILED Process='{0}' Title='{1}' Handle='{2}'" -f $processName, ($Title -replace "'", "''"), $hWnd)
+            }
         }
         return $true
     }
@@ -1212,7 +1310,33 @@ try {
 
 				break
             }
+            elseif (-not (Test-ToolbarReservationRequested -ToolbarPid $script:PinnedPid)) {
+                # Hide transition: release applications once; do not move the
+                # toolbar itself, which manages its own auto-hide position.
+                if (-not $script:ReservationSuspended) {
+                    Restore-ManagedWindows
+                    $script:ReservationSuspended = $true
+                    Write-Log -Message 'RESERVATION_RELEASED Reason=ToolbarHiddenOrUndocked; see WINDOW_RESTORED entries above.'
+                }
+            }
             else {
+                if ($script:ReservationSuspended) {
+                    $script:ReservationSuspended = $false
+                    [void](Initialize-PinnedApplication)
+                    Write-Log -Message 'RESERVATION_APPLIED Reason=ToolbarUnhiddenOrRedocked; see WINDOW_ADJUSTED entries.'
+                }
+                # Visibility JSON includes Monitor and MonitorBounds for
+                # diagnostics. Actual window handle determines monitor.
+                # On a monitor transition, restore the previous monitor
+                # BEFORE overwriting LastValidTargetScreen / WorkingArea.
+                $nextScreen = [System.Windows.Forms.Screen]::FromHandle($script:PinnedHwnd)
+                if ($null -ne $script:LastValidTargetScreen -and
+                    $nextScreen.DeviceName -ne $script:LastValidTargetScreen.DeviceName) {
+                    Write-Log -Message ("MONITOR_CHANGED From='{0}' To='{1}'" -f
+                        $script:LastValidTargetScreen.DeviceName, $nextScreen.DeviceName)
+                    Restore-ManagedWindows
+                    [void](Initialize-PinnedApplication)
+                }
                 # Refresh valid geometry and enforce the reserved area.
                 $script:TargetScreen = [System.Windows.Forms.Screen]::FromHandle($script:PinnedHwnd)
                 $WorkingArea = $script:TargetScreen.WorkingArea
@@ -1222,6 +1346,7 @@ try {
                 $script:ApplicationBottom = $WorkingArea.Bottom
                 $script:MaximumApplicationHeight = $WorkingArea.Height - $PinnedHeight
 
+                Assert-PinnedToolbarBounds
                 [void][ReserveTopWin32ChromiumV2]::EnumWindows($ResizeCallback, [IntPtr]::Zero)
             }
         }
@@ -1232,7 +1357,13 @@ try {
             [void][ReserveTopWin32ChromiumV2]::EnumWindows($FindPinnedCallback, [IntPtr]::Zero)
 
             if ($script:PinnedHwnd -ne [IntPtr]::Zero) {
-                if (Initialize-PinnedApplication) {
+                if (-not (Test-ToolbarReservationRequested -ToolbarPid $script:PinnedPid)) {
+                    # Toolbar was found, but is currently hidden.
+                    $script:PinnedApplicationPresent = $true
+                    $script:ReservationSuspended = $true
+                    Write-Log -Message 'Toolbar detected in hidden mode. Reservation is suspended.'
+                }
+                elseif (Initialize-PinnedApplication) {
                     Write-Log -Message "Pinned application detected. Reserved-area resizing is enabled."
                     # Apply the layout immediately instead of waiting one interval.
                     [void][ReserveTopWin32ChromiumV2]::EnumWindows($ResizeCallback, [IntPtr]::Zero)
@@ -1250,6 +1381,19 @@ try {
     }
 }
 finally {
+    # Do not remove state while a toolbar process still owns it.
+    try {
+        if (Test-Path -LiteralPath $script:VisibilityStateFile -PathType Leaf) {
+            $state = Get-Content -LiteralPath $script:VisibilityStateFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $owner = Get-Process -Id ([int]$state.ProcessId) -ErrorAction SilentlyContinue
+            if ($null -eq $owner) {
+                Remove-Item -LiteralPath $script:VisibilityStateFile -Force -ErrorAction Stop
+                Write-Log -Message 'Removed orphaned ToolbarVisibility.json during Reserve-Top shutdown.'
+            }
+        }
+    } catch {
+        Write-Log -Level WARNING -Message ("Visibility-state cleanup failed: {0}" -f $_.Exception.Message)
+    }
     Write-SilentMessage ""
     Write-SilentMessage "============================================================"
     Write-Log -Message "Monitoring stopped."

@@ -6,24 +6,62 @@
     },
     {
       "Name": "Master Button File",
-      "Value": "Masterfile.json"
+      "Value": "MasterFile.json"
+    },
+	{
+      "Name": "Master Button Genshare File",
+      "Value": "MasterGenFile.json"
     },
     {
       "Name": "Button Limit",
-      "Value": "30"
+      "Value": "50"
     },
     {
-      "Name": "Top Space for Toolbar",
-      "Value": "45"
+      "Name": "Rows",
+      "Value": "1"
+    },
+	{
+      "Name": "Genshare Registry",
+      "Value": "HKLM\\SOFTWARE\\SSOProvider\\ISXAgent:Type"
+    },
+    {
+      "_comment": "Yes, No, Windows (Use Windows setting)",
+      "Name": "Dark Mode",
+      "Value": "No"
+    },
+	{
+      "_comment1": "Kill, LogOff, None",
+      "Name": "Third Button",
+      "Value": "Kill"
+    },
+	{
+      "Name": "Start Hidden",
+      "Value": "No"
+    },	
+	{
+      "Name": "LogOff Confirmation",
+      "Value": "Yes"
+    },
+	{
+      "Name": "PRT URL",
+      "Value": "https://passwordreset.app.medcity.net/prod/"
     },
     {
       "Name": "Logged In User",
       "Value": "C:\\ProgramData\\Launchpad\\INIToolBackup\\FMBM\\loggedinUser.txt"
     },
-	{
+    {
       "Name": "App Exclusion",
       "Value": "notepad.exe, calculator.exe"
     },
+    {
+      "Name": "Toolbar Info",
+      "Value": "Once upon a time, in a land not so far away, HCA purchased a tool called Vergence to provide Single Sign-On (SSO) for thick-client and web applications.
+Vergence came with a handy little feature called Launchpad, which quickly became a favorite among clinicians. It served as a one-stop shop for launching applications from both Single User and GenShare devices. No more hunting around for applications—Launchpad had their backs!
+Fast forward a few years, and HCA decided to move from Vergence to OneSign, which eventually evolved into EAM. But there was one catch: clinicians had grown quite attached to their beloved Launchpad. So, HCA made it a requirement that Launchpad functionality move along with the new SSO solution. After all, you can't just take away someone's favorite shortcut!
+And that brings us to the HCA Toolbar an in-house developed replacement for Launchpad, designed to carry forward the same convenience and functionality.
+New name, new home, same mission: keeping clinicians just a click away from their applications!"
+    },	
     {
       "Name": "RoleShare",
       "Value": "\\\\xrdcnpsvmcfs01_cfs_ag1.hca.corpad.net\\onesign_files01\\CORP_RoleShare\\"
